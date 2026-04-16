@@ -147,6 +147,7 @@ type Server struct {
 	clientLog       *clientLog // forwards this session's log lines to its editor
 	followDelegates bool
 	debug           bool
+	definitionStyle string // "all" (default) or "first": controls multi-head definition results
 	mixBin          string // resolved path to the mix binary
 
 	beams  map[string]*beamProcess // build root → persistent BEAM process
@@ -221,6 +222,7 @@ func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions
 		projectRoot:     projectRoot,
 		explicitRoot:    projectRoot != "",
 		followDelegates: true,
+		definitionStyle: "all",
 		// Read here as well as in Initialize: the daemon's headless service
 		// answers CLI and MCP calls and never receives an initialize request.
 		debug:              os.Getenv("DEXTER_DEBUG") == "true",
@@ -800,6 +802,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		if v, ok := opts["maxTransientDocuments"].(float64); ok {
 			s.docs.SetMaxTransient(int(v))
 		}
+		if v, ok := opts["definitionStyle"].(string); ok {
+			if v == "all" || v == "first" {
+				s.definitionStyle = v
+			}
+		}
 	}
 	if os.Getenv("DEXTER_DEBUG") == "true" {
 		s.debug = true
@@ -1197,13 +1204,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		})
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d semantic result(s) for %s.%s", len(results), fullModule, functionName)
-			return nameLocationsToProtocol(results), nil
+			return s.applyDefinitionStyle(nameLocationsToProtocol(results)), nil
 		}
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via current file use chain for %s", len(results), functionName)
-			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
+			return s.applyDefinitionStyle(storeResultsToLocations(byKindForContext(tf, lineNum, results))), nil
 		}
 
 		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
@@ -1239,7 +1246,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		if err != nil {
 			return nil, nil
 		}
-		return nameLocationsToProtocol(results), nil
+		return s.applyDefinitionStyle(nameLocationsToProtocol(results)), nil
 	}
 
 	results, err := s.LookupName(fullModule, "", NameLookupOptions{})
@@ -1262,6 +1269,13 @@ func nameLocationsToProtocol(results []NameLocation) []protocol.Location {
 			URI:   uri.File(result.FilePath),
 			Range: lineRange(result.Line - 1),
 		})
+	}
+	return locations
+}
+
+func (s *Server) applyDefinitionStyle(locations []protocol.Location) []protocol.Location {
+	if s.definitionStyle == "first" && len(locations) > 1 {
+		return locations[:1]
 	}
 	return locations
 }
