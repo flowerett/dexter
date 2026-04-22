@@ -26,6 +26,8 @@ type NameLookupOptions struct {
 	External         bool
 	FallbackToModule bool
 	ExcludeStdlib    bool
+	Arity            int
+	ExactArity       bool
 	// ExactModule places a generated function only at its own module's
 	// definition. Without it, a module that exists only as a BEAM, such as
 	// Phoenix route helpers, resolves to the nearest lexical parent with source;
@@ -52,8 +54,12 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 
 	var results []store.LookupResult
 	var err error
-	if opts.FollowDelegates {
+	if opts.FollowDelegates && opts.ExactArity {
+		results, err = s.store.LookupFollowDelegateByArity(module, function, opts.Arity)
+	} else if opts.FollowDelegates {
 		results, err = s.store.LookupFollowDelegate(module, function)
+	} else if opts.ExactArity {
+		results, err = s.store.LookupFunctionByArity(module, function, opts.Arity)
 	} else {
 		results, err = s.store.LookupFunction(module, function)
 	}
@@ -66,6 +72,9 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 	}
 	if len(results) == 0 {
 		results = filterLookupKind(s.lookupThroughUseOfWithFollow(module, function, opts.FollowDelegates), opts.Kind)
+		if opts.ExactArity {
+			results = filterLookupArity(results, opts.Arity)
+		}
 	}
 	if len(results) == 0 && opts.Kind != NameKindType {
 		if generated, found := s.generatedSymbol(module, "", function); found && len(generated) > 0 {
@@ -89,6 +98,16 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 		}
 	}
 	return s.lookupLocations(results, opts.ExcludeStdlib), nil
+}
+
+func filterLookupArity(results []store.LookupResult, arity int) []store.LookupResult {
+	filtered := results[:0]
+	for _, result := range results {
+		if result.Arity == arity {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
 }
 
 // ReferenceNames finds references after a frontend has resolved a canonical

@@ -1131,6 +1131,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	callArity := tf.ArityAtCallsite(lineNum, exprCtx.ExprStart, exprCtx.ExprEnd)
 
 	if moduleRef != "" {
 		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
@@ -1140,7 +1141,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUseTokenized(tf, aliases)
-	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
+	s.debugf("Definition: expr=%q module=%q function=%q arity=%d", expr, moduleRef, functionName, callArity)
 
 	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
 	if moduleRef == "" {
@@ -1201,6 +1202,8 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			Kind:            kind,
 			FollowDelegates: s.followDelegates,
 			External:        fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
+			Arity:           callArity,
+			ExactArity:      callArity >= 0,
 		})
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d semantic result(s) for %s.%s", len(results), fullModule, functionName)
@@ -1242,6 +1245,8 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			FollowDelegates:  s.followDelegates,
 			External:         fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
 			FallbackToModule: true,
+			Arity:            callArity,
+			ExactArity:       callArity >= 0,
 		})
 		if err != nil {
 			return nil, nil
