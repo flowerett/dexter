@@ -245,6 +245,9 @@ func TestServer_InitializationOptions(t *testing.T) {
 		if server.debug {
 			t.Error("debug should default to false")
 		}
+		if server.definitionStyle != "all" {
+			t.Errorf("definitionStyle: got %q, want %q", server.definitionStyle, "all")
+		}
 	})
 
 	// Claude Code plugin template substitution yields strings, not booleans.
@@ -254,12 +257,13 @@ func TestServer_InitializationOptions(t *testing.T) {
 		opts          map[string]interface{}
 		wantFollowDel bool
 		wantDebug     bool
+		wantStyle     string
 	}{
-		{"bool true/false", map[string]interface{}{"followDelegates": false, "debug": true}, false, true},
-		{"string true/false", map[string]interface{}{"followDelegates": "false", "debug": "true"}, false, true},
-		{"string 1/0", map[string]interface{}{"followDelegates": "0", "debug": "1"}, false, true},
-		{"empty string leaves default", map[string]interface{}{"followDelegates": "", "debug": ""}, true, false},
-		{"unsupported type leaves default", map[string]interface{}{"followDelegates": 1, "debug": 0}, true, false},
+		{"bool true/false", map[string]interface{}{"followDelegates": false, "debug": true, "definitionStyle": "first"}, false, true, "first"},
+		{"string true/false", map[string]interface{}{"followDelegates": "false", "debug": "true", "definitionStyle": "all"}, false, true, "all"},
+		{"string 1/0", map[string]interface{}{"followDelegates": "0", "debug": "1"}, false, true, "all"},
+		{"empty string leaves default", map[string]interface{}{"followDelegates": "", "debug": "", "definitionStyle": ""}, true, false, "all"},
+		{"unsupported values leave default", map[string]interface{}{"followDelegates": 1, "debug": 0, "definitionStyle": "bogus"}, true, false, "all"},
 	}
 
 	for _, tc := range cases {
@@ -280,46 +284,10 @@ func TestServer_InitializationOptions(t *testing.T) {
 			if server.debug != tc.wantDebug {
 				t.Errorf("debug: got %v, want %v", server.debug, tc.wantDebug)
 			}
+			if server.definitionStyle != tc.wantStyle {
+				t.Errorf("definitionStyle: got %q, want %q", server.definitionStyle, tc.wantStyle)
+			}
 		})
-	}
-}
-
-func TestServer_InitializationOptions_DefinitionStyle(t *testing.T) {
-	server, cleanup := setupTestServer(t)
-	defer cleanup()
-
-	// Default should be "all"
-	if server.definitionStyle != "all" {
-		t.Errorf("definitionStyle should default to %q, got %q", "all", server.definitionStyle)
-	}
-
-	// Simulate initializationOptions with definitionStyle="first"
-	opts := map[string]interface{}{
-		"definitionStyle": "first",
-	}
-	if v, ok := opts["definitionStyle"].(string); ok {
-		if v == "all" || v == "first" {
-			server.definitionStyle = v
-		}
-	}
-
-	if server.definitionStyle != "first" {
-		t.Errorf("definitionStyle should be %q after setting, got %q", "first", server.definitionStyle)
-	}
-
-	// Invalid value should not change the setting
-	server.definitionStyle = "all"
-	opts = map[string]interface{}{
-		"definitionStyle": "bogus",
-	}
-	if v, ok := opts["definitionStyle"].(string); ok {
-		if v == "all" || v == "first" {
-			server.definitionStyle = v
-		}
-	}
-
-	if server.definitionStyle != "all" {
-		t.Errorf("definitionStyle should remain %q for invalid value, got %q", "all", server.definitionStyle)
 	}
 }
 
@@ -425,6 +393,88 @@ end
 	if len(locs) != 1 {
 		t.Fatalf("expected exactly 1 location for square/1 call, got %d — "+
 			"LookupFunction is not filtering by arity: %+v", len(locs), locs)
+	}
+}
+
+func TestDefinition_CurrentModuleBareCallUsesArityAndStyle(t *testing.T) {
+	t.Run("selects matching arity", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		content := `defmodule MyApp.Current do
+  def calculate(value), do: value
+  def calculate(left, right), do: left + right
+  def run, do: calculate(1, 2)
+end
+`
+		path := filepath.Join(server.projectRoot, "lib", "current.ex")
+		indexFile(t, server.store, server.projectRoot, "lib/current.ex", content)
+		uri := "file://" + path
+		server.docs.Set(uri, content)
+
+		locs := definitionAt(t, server, uri, 3, 17)
+		if len(locs) != 1 || locs[0].Range.Start.Line != 2 {
+			t.Fatalf("expected calculate/2 on line 2, got %+v", locs)
+		}
+	})
+
+	t.Run("returns all same-arity heads by default", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		content := `defmodule MyApp.Current do
+  def calculate(:first), do: 1
+  def calculate(:second), do: 2
+  def run, do: calculate(:first)
+end
+`
+		path := filepath.Join(server.projectRoot, "lib", "current.ex")
+		indexFile(t, server.store, server.projectRoot, "lib/current.ex", content)
+		uri := "file://" + path
+		server.docs.Set(uri, content)
+
+		locs := definitionAt(t, server, uri, 3, 17)
+		if len(locs) != 2 {
+			t.Fatalf("expected both calculate/1 heads, got %+v", locs)
+		}
+	})
+}
+
+func TestDefinition_UseChainSelectsProviderByArity(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/one.ex", `defmodule SharedLib.One do
+  def execute(value), do: value
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/two.ex", `defmodule SharedLib.Two do
+  def execute(left, right), do: {left, right}
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/injector.ex", `defmodule SharedLib.Injector do
+  defmacro __using__(_opts) do
+    quote do
+      import SharedLib.One
+      import SharedLib.Two
+    end
+  end
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "consumer.ex")
+	callerContent := `defmodule MyApp.Consumer do
+  use SharedLib.Injector
+  def run, do: execute(:value)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/consumer.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	locs := definitionAt(t, server, callerURI, 2, 16)
+	if len(locs) != 1 || !strings.HasSuffix(string(locs[0].URI), "/lib/one.ex") {
+		t.Fatalf("expected SharedLib.One.execute/1, got %+v", locs)
 	}
 }
 

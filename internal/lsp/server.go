@@ -1182,15 +1182,16 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		// Current module — return buffer location directly (works before indexing).
 		// In a typespec the bare name is the type, everywhere else the function.
 		if fullModule == currentModule {
-			find := tf.FindFunctionDefinition
-			if tf.InTypespec(lineNum) {
-				find = tf.FindTypeDefinition
-			}
-			if line, found := find(functionName); found {
-				return []protocol.Location{{
-					URI:   params.TextDocument.URI,
-					Range: lineRange(line - 1),
-				}}, nil
+			lines := tf.FindDefinitionLines(functionName, callArity, tf.InTypespec(lineNum))
+			if len(lines) > 0 {
+				locations := make([]protocol.Location, 0, len(lines))
+				for _, line := range lines {
+					locations = append(locations, protocol.Location{
+						URI:   params.TextDocument.URI,
+						Range: lineRange(line - 1),
+					})
+				}
+				return s.applyDefinitionStyle(locations), nil
 			}
 		}
 
@@ -1211,7 +1212,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
-		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
+		if results := s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates, callArity); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via current file use chain for %s", len(results), functionName)
 			return s.applyDefinitionStyle(storeResultsToLocations(byKindForContext(tf, lineNum, results))), nil
 		}
@@ -2507,10 +2508,10 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 // fullModule's source file. This handles qualified calls like M.func() where
 // func is not defined directly in M but is injected by a macro M uses.
 func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.LookupResult {
-	return s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates)
+	return s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates, -1)
 }
 
-func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, followDelegates bool) []store.LookupResult {
+func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, followDelegates bool, arity int) []store.LookupResult {
 	modResults, err := s.store.LookupModule(fullModule)
 	if err != nil || len(modResults) == 0 {
 		return nil
@@ -2519,7 +2520,7 @@ func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, f
 	if !ok {
 		return nil
 	}
-	return s.lookupThroughUseWithFollow(fileText, functionName, ExtractAliases(fileText), followDelegates)
+	return s.lookupThroughUseWithFollow(fileText, functionName, ExtractAliases(fileText), followDelegates, arity)
 }
 
 // lookupThroughUse searches for functionName in definitions injected by `use`
@@ -2527,15 +2528,15 @@ func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, f
 // priority over imported ones. Later `use` declarations shadow earlier ones.
 // Transitive use chains (use inside __using__ body) are followed recursively.
 func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]string) []store.LookupResult {
-	return s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates)
+	return s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates, -1)
 }
 
-func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases map[string]string, followDelegates bool) []store.LookupResult {
+func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases map[string]string, followDelegates bool, arity int) []store.LookupResult {
 	useCalls := ExtractUsesWithOpts(text, aliases)
 	visited := make(map[string]bool)
 
 	for i := len(useCalls) - 1; i >= 0; i-- {
-		if result := s.lookupInUsingEntryForWithFollow(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited, followDelegates); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited, followDelegates, arity); result != nil {
 			return result
 		}
 	}
@@ -2547,7 +2548,7 @@ func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases m
 // consumerOpts are the keyword args from the `use Module, key: Val` call and
 // are used to resolve dynamic imports like `import unquote(mod)`.
 func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
-	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, "", consumerOpts, visited, s.followDelegates)
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, "", consumerOpts, visited, s.followDelegates, -1)
 }
 
 // bodyFor picks the injected body for a `use` call. An ordinary __using__ has a
@@ -2580,10 +2581,10 @@ func usingVisitKey(moduleName, which string) string {
 // lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
 // `use` site (empty for an ordinary `use Module`).
 func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
-	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, which, consumerOpts, visited, s.followDelegates)
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, which, consumerOpts, visited, s.followDelegates, -1)
 }
 
-func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool) []store.LookupResult {
+func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool, arity int) []store.LookupResult {
 	visitKey := usingVisitKey(moduleName, which)
 	if visited[visitKey] {
 		return nil
@@ -2603,6 +2604,9 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 	if defs, ok := body.inlineDefs[functionName]; ok {
 		var results []store.LookupResult
 		for _, d := range defs {
+			if arity >= 0 && d.arity != arity {
+				continue
+			}
 			results = append(results, store.LookupResult{
 				FilePath: entry.filePath,
 				Line:     d.line,
@@ -2610,15 +2614,23 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 				Arity:    d.arity,
 			})
 		}
-		return results
+		if len(results) > 0 {
+			return results
+		}
 	}
 
 	// Static imports
 	for j := len(body.imports) - 1; j >= 0; j-- {
 		var results []store.LookupResult
 		var err error
-		if followDelegates {
+		if followDelegates && arity >= 0 {
+			results, err = s.store.LookupFollowDelegateByArity(body.imports[j], functionName, arity)
+			results = publicOnly(results)
+		} else if followDelegates {
 			results, err = s.store.LookupFollowDelegate(body.imports[j], functionName)
+			results = publicOnly(results)
+		} else if arity >= 0 {
+			results, err = s.store.LookupFunctionByArity(body.imports[j], functionName, arity)
 			results = publicOnly(results)
 		} else {
 			results, err = s.store.LookupPublicFunction(body.imports[j], functionName)
@@ -2642,8 +2654,14 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 		case "import":
 			var results []store.LookupResult
 			var err error
-			if followDelegates {
+			if followDelegates && arity >= 0 {
+				results, err = s.store.LookupFollowDelegateByArity(mod, functionName, arity)
+				results = publicOnly(results)
+			} else if followDelegates {
 				results, err = s.store.LookupFollowDelegate(mod, functionName)
+				results = publicOnly(results)
+			} else if arity >= 0 {
+				results, err = s.store.LookupFunctionByArity(mod, functionName, arity)
 				results = publicOnly(results)
 			} else {
 				results, err = s.store.LookupPublicFunction(mod, functionName)
@@ -2652,7 +2670,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 				return results
 			}
 		case "use":
-			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", nil, visited, followDelegates); result != nil {
+			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", nil, visited, followDelegates, arity); result != nil {
 				return result
 			}
 		}
@@ -2661,7 +2679,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 	// Transitive uses: use Module inside the __using__ body (double-use chains)
 	for k := len(body.transCalls) - 1; k >= 0; k-- {
 		call := body.transCalls[k]
-		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), call.Opts, visited, followDelegates); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), call.Opts, visited, followDelegates, arity); result != nil {
 			return result
 		}
 	}
@@ -2669,7 +2687,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 		if body.hasTransCall(body.transUses[k]) {
 			continue
 		}
-		if result := s.lookupInUsingEntryForWithFollow(body.transUses[k], functionName, "", nil, visited, followDelegates); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(body.transUses[k], functionName, "", nil, visited, followDelegates, arity); result != nil {
 			return result
 		}
 	}
