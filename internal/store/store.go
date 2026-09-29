@@ -1140,7 +1140,7 @@ func (s *Store) LookupFunctionByArity(module, function string, arity int) ([]Loo
 		return s.LookupFunction(module, function)
 	}
 	return s.queryLookup(
-		"SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND arity = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
+		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.arity = ? AND d.kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN d.kind IN ('type', 'opaque') THEN 1 ELSE 0 END, d.line",
 		module, function, arity,
 	)
 }

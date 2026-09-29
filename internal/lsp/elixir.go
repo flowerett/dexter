@@ -155,6 +155,7 @@ func countCallArgs(tokens []parser.Token, n, openIdx int) int {
 	depth := 1
 	args := 0
 	hasContent := false
+	keywordTail := false
 	for i := openIdx + 1; i < n && depth > 0; i++ {
 		switch tokens[i].Kind {
 		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace, parser.TokOpenAngle:
@@ -170,9 +171,19 @@ func countCallArgs(tokens []parser.Token, n, openIdx int) int {
 			}
 		case parser.TokComma:
 			if depth == 1 {
+				// Elixir's trailing keyword syntax is one list argument even
+				// though its entries are separated by top-level commas.
+				if keywordTail {
+					continue
+				}
 				args++
 				hasContent = false
 				continue
+			}
+			hasContent = true
+		case parser.TokColon:
+			if depth == 1 && i > openIdx+1 && tokens[i-1].Kind == parser.TokIdent {
+				keywordTail = true
 			}
 			hasContent = true
 		case parser.TokEOL, parser.TokComment:

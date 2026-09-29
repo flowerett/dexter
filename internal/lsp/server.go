@@ -2603,7 +2603,12 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 	if defs, ok := body.inlineDefs[functionName]; ok {
 		var results []store.LookupResult
 		for _, d := range defs {
-			results = append(results, store.LookupResult{FilePath: entry.filePath, Line: d.line})
+			results = append(results, store.LookupResult{
+				FilePath: entry.filePath,
+				Line:     d.line,
+				Kind:     d.kind,
+				Arity:    d.arity,
+			})
 		}
 		return results
 	}

@@ -437,6 +437,15 @@ func TestExpressionAtCursor_ExprBounds(t *testing.T) {
 	}
 }
 
+func TestArityAtCallsite_KeywordTailCountsAsOneArgument(t *testing.T) {
+	code := "SharedLib.Repo.insert(changeset, returning: true, on_conflict: :replace)"
+	tf := NewTokenizedFile(code)
+	ctx := tf.ExpressionAtCursor(0, strings.Index(code, "insert")+2)
+	if got := tf.ArityAtCallsite(0, ctx.ExprStart, ctx.ExprEnd); got != 2 {
+		t.Fatalf("ArityAtCallsite() = %d, want 2", got)
+	}
+}
+
 func TestCursorContext_Expr(t *testing.T) {
 	tests := []struct {
 		mod, fn, want string

@@ -428,6 +428,34 @@ end
 	}
 }
 
+func TestDefinition_KeywordTailCountsAsOneArgument(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/repo.ex", `defmodule SharedLib.Repo do
+  def insert(changeset, opts), do: {changeset, opts}
+  def insert(changeset, opts, metadata), do: {changeset, opts, metadata}
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+	callerContent := `defmodule MyApp.Caller do
+  def run(changeset), do: SharedLib.Repo.insert(changeset, returning: true, on_conflict: :replace)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	locs := definitionAt(t, server, callerURI, 1, 44)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly 1 location for insert/2, got %d: %+v", len(locs), locs)
+	}
+	if got := locs[0].Range.Start.Line; got != 1 {
+		t.Fatalf("expected keyword tail to resolve insert/2 on line 1, got line %d", got)
+	}
+}
+
 // defdelegate + def with the same name in the same module. The caller writes
 // Mod.do_thing(x); the human reads this as "one definition" (the delegate) but
 // LookupFollowDelegate returns both the defdelegate line and the def line
