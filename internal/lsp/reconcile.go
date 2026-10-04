@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"log"
 	"os"
@@ -64,7 +65,7 @@ type parsedFile struct {
 // continues, and one writer stores them in batched transactions. A file and its
 // rows are always in one transaction, so a canceled pass leaves each file either
 // fully old or fully new, and the next pass redoes the rest from their mtimes.
-func (s *Server) reconcileChangedFiles() (map[string]struct{}, int, bool) {
+func (s *Server) reconcileChangedFiles(progress *reconcileProgress) (map[string]struct{}, int, bool) {
 	ctx := s.index.work
 	// The walk writes, so it takes indexWrites for reading, the same as every
 	// other single-file write. That is what keeps it from overlapping a cold
@@ -132,17 +133,17 @@ func (s *Server) reconcileChangedFiles() (map[string]struct{}, int, bool) {
 		// single-file write that lands in between is either rewritten here or
 		// copied over as it is.
 		s.index.writes.RUnlock()
-		n, ok := s.rebuildChanged(ctx, changed)
+		n, ok := s.rebuildChanged(ctx, changed, progress)
 		s.index.writes.RLock()
 		written = n
 		if !ok && ctx.Err() == nil && !s.index.unavailable {
 			// Batches are slower but need nothing the rebuild did, so a
 			// failed rebuild does not leave the change set unindexed.
 			log.Printf("Warning: index rebuild failed, writing %d changed files in batches", len(changed))
-			written = s.writeChangedInBatches(ctx, changed)
+			written = s.writeChangedInBatches(ctx, changed, progress)
 		}
 	default:
-		written = s.writeChangedInBatches(ctx, changed)
+		written = s.writeChangedInBatches(ctx, changed, progress)
 	}
 	if ctx.Err() != nil {
 		return seen, written, false
@@ -152,8 +153,8 @@ func (s *Server) reconcileChangedFiles() (map[string]struct{}, int, bool) {
 
 // writeChangedInBatches parses changed files on every core and writes them
 // through batched transactions. It returns how many files it wrote.
-func (s *Server) writeChangedInBatches(ctx context.Context, changed []changedFile) int {
-	pipe := s.startReconcilePipeline(ctx)
+func (s *Server) writeChangedInBatches(ctx context.Context, changed []changedFile, progress *reconcileProgress) int {
+	pipe := s.startReconcilePipeline(ctx, progress)
 	for _, f := range changed {
 		if pipe.send(f) != nil {
 			break
@@ -169,7 +170,9 @@ type parsePool struct {
 	results chan parsedFile
 }
 
-func newParsePool(ctx context.Context) *parsePool {
+// newParsePool starts the parse workers. onError, which several workers can
+// call at once, is told about each file that could not be read or parsed.
+func newParsePool(ctx context.Context, onError func(path string, err error)) *parsePool {
 	workers := runtime.NumCPU()
 	p := &parsePool{
 		ctx:     ctx,
@@ -191,12 +194,14 @@ func newParsePool(ctx context.Context) *parsePool {
 				if f.symlink {
 					info, err := os.Stat(f.path)
 					if err != nil {
+						onError(f.path, err)
 						continue
 					}
 					f.mtimeNano = info.ModTime().UnixNano()
 				}
 				defs, refs, err := parser.ParseFile(f.path)
 				if err != nil {
+					onError(f.path, err)
 					continue
 				}
 				if !f.refs {
@@ -234,10 +239,34 @@ type reconcilePipeline struct {
 	written chan int
 }
 
-func (s *Server) startReconcilePipeline(ctx context.Context) *reconcilePipeline {
-	p := &reconcilePipeline{parsePool: newParsePool(ctx), written: make(chan int, 1)}
-	go func() { p.written <- s.writeReconciled(ctx, p.results) }()
+func (s *Server) startReconcilePipeline(ctx context.Context, progress *reconcileProgress) *reconcilePipeline {
+	p := &reconcilePipeline{parsePool: newParsePool(ctx, s.reconcileParseFailed), written: make(chan int, 1)}
+	go func() { p.written <- s.writeReconciled(ctx, p.results, progress) }()
 	return p
+}
+
+// reconcileParseFailed records a changed file that could not be read or
+// parsed. Its old rows stay, and the editor is told about it.
+func (s *Server) reconcileParseFailed(path string, err error) {
+	if !errors.Is(err, fs.ErrNotExist) {
+		log.Printf("Warning: reindex %s: %v", path, err)
+	}
+	s.index.failures.fail(path, err)
+}
+
+// reconcileWritten records a file whose new rows are committed.
+func (s *Server) reconcileWritten(path string, progress *reconcileProgress) {
+	s.index.failures.ok(path)
+	if progress != nil {
+		progress.file()
+	}
+}
+
+// reconcileWriteFailed records a changed file whose rows could not be
+// written. It keeps its old mtime, so the next pass tries it again.
+func (s *Server) reconcileWriteFailed(path string, err error) {
+	log.Printf("Warning: reindex %s: %v", path, err)
+	s.index.failures.fail(path, err)
 }
 
 // finish waits for every queued file to be parsed and written, and returns how
@@ -250,7 +279,7 @@ func (p *reconcilePipeline) finish() int {
 // rebuildChanged parses the change set on every core and writes it through one
 // rebuild transaction. It returns how many files it wrote, and false when the
 // rebuild failed or was canceled, in which case it wrote none.
-func (s *Server) rebuildChanged(ctx context.Context, changed []changedFile) (int, bool) {
+func (s *Server) rebuildChanged(ctx context.Context, changed []changedFile, progress *reconcileProgress) (int, bool) {
 	s.index.writes.Lock()
 	defer s.index.writes.Unlock()
 	if s.index.unavailable {
@@ -266,6 +295,7 @@ func (s *Server) rebuildChanged(ctx context.Context, changed []changedFile) (int
 	}
 	results := s.parseChanged(ctx, changed)
 	files := 0
+	var writtenPaths []string // marked written once the rebuild commits
 	var writeErr error
 	for res := range results {
 		if writeErr != nil || ctx.Err() != nil {
@@ -273,6 +303,7 @@ func (s *Server) rebuildChanged(ctx context.Context, changed []changedFile) (int
 		}
 		if writeErr = writeParsed(batch, res); writeErr == nil {
 			files++
+			writtenPaths = append(writtenPaths, res.path)
 		}
 	}
 	if writeErr == nil {
@@ -300,6 +331,9 @@ func (s *Server) rebuildChanged(ctx context.Context, changed []changedFile) (int
 		}
 		return 0, false
 	}
+	for _, path := range writtenPaths {
+		s.reconcileWritten(path, progress)
+	}
 	log.Printf("Rebuilt the index with %d changed files (parse and write %s, swap and index %s)", files,
 		written.Sub(start).Round(time.Millisecond), time.Since(written).Round(time.Millisecond))
 	return files, true
@@ -321,7 +355,7 @@ func writeParsed(b *store.Batch, res parsedFile) error {
 // parseChanged parses files on every core and streams the results. The channel
 // closes when every file is parsed, or soon after ctx is canceled.
 func (s *Server) parseChanged(ctx context.Context, changed []changedFile) <-chan parsedFile {
-	p := newParsePool(ctx)
+	p := newParsePool(ctx, s.reconcileParseFailed)
 	go func() {
 		for _, f := range changed {
 			if p.send(f) != nil {
@@ -339,7 +373,7 @@ func (s *Server) parseChanged(ctx context.Context, changed []changedFile) <-chan
 // transaction, so only a file that fails by itself is lost; it keeps its old
 // mtime, so the next pass retries it. After cancellation it rolls back the open
 // batch and only drains.
-func (s *Server) writeReconciled(ctx context.Context, results <-chan parsedFile) int {
+func (s *Server) writeReconciled(ctx context.Context, results <-chan parsedFile, progress *reconcileProgress) int {
 	var (
 		batch   *store.Batch
 		group   []parsedFile // the files in batch, kept for a one-by-one retry
@@ -354,10 +388,11 @@ func (s *Server) writeReconciled(ctx context.Context, results <-chan parsedFile)
 			}
 			if err := s.writeOne(ctx, res); err != nil {
 				if ctx.Err() == nil {
-					log.Printf("Warning: reindex %s: %v", res.path, err)
+					s.reconcileWriteFailed(res.path, err)
 				}
 				continue
 			}
+			s.reconcileWritten(res.path, progress)
 			written++
 		}
 	}
@@ -369,6 +404,9 @@ func (s *Server) writeReconciled(ctx context.Context, results <-chan parsedFile)
 		switch {
 		case err == nil:
 			written += len(group)
+			for _, res := range group {
+				s.reconcileWritten(res.path, progress)
+			}
 		case ctx.Err() == nil:
 			retryOneByOne(err)
 		}
@@ -390,7 +428,7 @@ func (s *Server) writeReconciled(ctx context.Context, results <-chan parsedFile)
 			b, err := s.store.BeginBatchContext(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
-					log.Printf("Warning: reindex %s: %v", res.path, err)
+					s.reconcileWriteFailed(res.path, err)
 				}
 				continue
 			}
