@@ -97,6 +97,16 @@ type IndexCoordinator struct {
 	stdlibMu   sync.RWMutex
 	stdlibRoot string
 
+	// renameSerial keeps renames one at a time across every session of the
+	// workspace, editor and headless alike. A rename reads the affected files
+	// and writes them back; two at once would each write over the other's
+	// edits. It is held from the first read of the affected files to the end
+	// of the writes, and no other request takes it. renameIndexed, guarded by
+	// it, closes when the index shows the last rename, so the next rename
+	// checks its new name against a current index.
+	renameSerial  sync.Mutex
+	renameIndexed <-chan struct{}
+
 	// writes is held for writing by a cold full build and for reading by every
 	// single-file write. The bulk path is insert-only and cannot overlap any
 	// incremental mutation.
@@ -118,6 +128,24 @@ type IndexCoordinator struct {
 	// reconciliation pass, a prune, and a cold build check it and stop.
 	work       context.Context
 	cancelWork context.CancelFunc
+}
+
+// lockRename takes renameSerial and waits until the index shows the last
+// rename. It returns the unlock. When ctx ends first, it returns ctx's error
+// and holds nothing, so a canceled rename does not start to write.
+func (ic *IndexCoordinator) lockRename(ctx context.Context) (func(), error) {
+	ic.renameSerial.Lock()
+	if ic.renameIndexed != nil {
+		select {
+		case <-ic.renameIndexed:
+		case <-ctx.Done():
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		ic.renameSerial.Unlock()
+		return nil, fmt.Errorf("the rename was canceled before it changed any file: %w", err)
+	}
+	return ic.renameSerial.Unlock, nil
 }
 
 // CancelWork stops the reconciliation in flight and makes every later one
@@ -1089,7 +1117,7 @@ func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDo
 	if len(params.ContentChanges) > 0 {
 		// Full sync mode — last change contains the full text
 		text := params.ContentChanges[len(params.ContentChanges)-1].Text
-		s.docs.Set(string(params.TextDocument.URI), text)
+		s.docs.SetChanged(string(params.TextDocument.URI), text)
 	}
 	return nil
 }
@@ -1115,6 +1143,7 @@ func (s *Server) restartBeamForFormatterConfig(path string) {
 }
 
 func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
+	s.docs.MarkSaved(string(params.TextDocument.URI))
 	path := uriToPath(params.TextDocument.URI)
 	if path == "" {
 		return nil
@@ -5737,7 +5766,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if existing, err := s.store.LookupFunction(fullModule, params.NewName); err == nil && len(existing) > 0 {
 					return nil, fmt.Errorf("function %s.%s already exists", fullModule, params.NewName)
 				}
-				return s.renameFunctionEdits(fullModule, functionName, params.NewName)
+				return s.renameFunctionEdits(ctx, fullModule, functionName, params.NewName, nil)
 			}
 		} else if moduleRef != "" {
 			fullModule := resolveModule(moduleRef, aliases)
@@ -5751,7 +5780,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if !isValidModuleName(newModule) {
 					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
 				}
-				return s.renameModuleEdits(fullModule, newModule)
+				return s.renameModuleEdits(ctx, fullModule, newModule, nil)
 			}
 		}
 	}
@@ -5760,8 +5789,18 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 }
 
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
-// module.functionName to newName across the codebase.
-func (s *Server) renameFunctionEdits(module, functionName, newName string) (*WorkspaceEdit, error) {
+// module.functionName to newName across the codebase. When report is not nil,
+// it receives the files the rename changed and the files it could not change.
+func (s *Server) renameFunctionEdits(ctx context.Context, module, functionName, newName string, report *RenameSummary) (*WorkspaceEdit, error) {
+	unlock, err := s.index.lockRename(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	// The check before the lock can race another rename to the same name.
+	if existing, err := s.store.LookupFunction(module, newName); err == nil && len(existing) > 0 {
+		return nil, fmt.Errorf("function %s.%s already exists", module, newName)
+	}
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -5885,7 +5924,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		}
 	}
 
-	edit := s.buildTextEdits(sites, functionName, newName)
+	edit := s.buildTextEdits(sites, functionName, newName, report)
 
 	// Update defdelegate lines that forward to this function: add or update
 	// the `as:` option so the facade keeps working after the rename.
@@ -5925,6 +5964,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 				}
 
 				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
+				report.changed(del.FilePath)
 				if open {
 					if edit.Changes == nil {
 						edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
@@ -5942,7 +5982,10 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 					newFileLines = append(newFileLines, fileLines[:spanStart]...)
 					newFileLines = append(newFileLines, updatedSpan...)
 					newFileLines = append(newFileLines, fileLines[spanEnd:]...)
-					_ = os.WriteFile(del.FilePath, []byte(strings.Join(newFileLines, "\n")), 0644)
+					if err := os.WriteFile(del.FilePath, []byte(strings.Join(newFileLines, "\n")), 0644); err != nil {
+						log.Printf("Rename: cannot write %s: %v", del.FilePath, err)
+						report.failed(del.FilePath, err)
+					}
 				}
 			}
 		}
@@ -5958,8 +6001,15 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 // parallel goroutines. Only open buffers are included in the returned
 // WorkspaceEdit, keeping the response small and avoiding editor freezes.
 // Files following the naming convention are also renamed/moved: closed ones
-// by the server, open ones by the client through rename operations.
-func (s *Server) renameModuleEdits(oldModule, newModule string) (*WorkspaceEdit, error) {
+// by the server, open ones by the client through rename operations. When
+// report is not nil, it receives the files the rename changed or moved and the
+// files it could not change.
+func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule string, report *RenameSummary) (*WorkspaceEdit, error) {
+	unlock, err := s.index.lockRename(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names
@@ -5975,8 +6025,10 @@ func (s *Server) renameModuleEdits(oldModule, newModule string) (*WorkspaceEdit,
 
 	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache)
 	openChanges := mr.applyEdits(fileCache, movedFiles)
-	mr.reindex(fileCache, movedFiles, clientRenames)
+	indexed := mr.reindex(fileCache, movedFiles, clientRenames)
 	s.reportRenameFailures(&mr.failures)
+	report.recordModuleRename(mr.sitesByFile, movedFiles, clientRenames, &mr.failures)
+	report.waitFor(indexed)
 
 	if len(clientRenames) == 0 {
 		return &WorkspaceEdit{Changes: openChanges}, nil
@@ -6272,10 +6324,14 @@ func (mr *moduleRename) findModuleEdits(lineText string, token string) []moduleE
 // is indexed as its own reference — so the reference's full name never appears
 // on the line.
 //
-// Which half moves depends on the rename: renaming the prefix rewrites the
-// prefix, renaming a member rewrites that member inside the braces. Sites for
-// the other members on the same line find nothing once the prefix is rewritten,
-// so a group is only edited once.
+// Which half moves depends on the rename. When the renamed module is the
+// prefix or one of its ancestors, every member moves with it, so the prefix is
+// rewritten; this is also correct for a group whose members continue on the
+// next lines, where the index records every member on the opening line. Sites
+// for the other members on the same line find nothing once the prefix is
+// rewritten, so a group is only edited once. When only the member is renamed,
+// the member is rewritten inside the braces, or, when it moves to another
+// namespace, it leaves the group and gets its own alias.
 func (mr *moduleRename) findGroupedAliasEdits(lineText, token, newToken string) []moduleEditResult {
 	dot := strings.LastIndexByte(token, '.')
 	if dot <= 0 {
@@ -6286,29 +6342,61 @@ func (mr *moduleRename) findGroupedAliasEdits(lineText, token, newToken string) 
 	if prefixCol < 0 {
 		return nil
 	}
-	memberCols := findAllTokenColumns(lineText[groupStart:groupEnd], member)
-	if len(memberCols) == 0 {
-		return nil
-	}
 
 	newDot := strings.LastIndexByte(newToken, '.')
 	if newDot <= 0 {
 		// The member lost its namespace; a grouped alias cannot express that.
 		return nil
 	}
-	if newPrefix := newToken[:newDot]; newPrefix != prefix {
+	newPrefix, newMember := newToken[:newDot], newToken[newDot+1:]
+	if prefix == mr.oldModule || strings.HasPrefix(prefix, mr.oldModule+".") {
+		if newPrefix == prefix {
+			return nil
+		}
 		return []moduleEditResult{{prefixCol, len(prefix), newPrefix}}
 	}
 
-	newMember := newToken[newDot+1:]
-	if newMember == member {
+	memberCols := findAllTokenColumns(lineText[groupStart:groupEnd], member)
+	if len(memberCols) == 0 {
 		return nil
 	}
-	results := make([]moduleEditResult, 0, len(memberCols))
-	for _, col := range memberCols {
-		results = append(results, moduleEditResult{groupStart + col, len(member), newMember})
+	if newPrefix == prefix {
+		if newMember == member {
+			return nil
+		}
+		results := make([]moduleEditResult, 0, len(memberCols))
+		for _, col := range memberCols {
+			results = append(results, moduleEditResult{groupStart + col, len(member), newMember})
+		}
+		return results
 	}
-	return results
+	return splitGroupedAlias(lineText, prefix, member, newToken, prefixCol, groupStart, groupEnd)
+}
+
+// splitGroupedAlias moves one member out of `Prefix.{A, B}` to its own
+// `alias New.A` line after the group, because only that member changes
+// namespace. Rewriting the shared prefix instead would move the other members
+// too. A group with no other member gets the new name in place. A group that
+// continues on the next lines is left unchanged: the members are not on this
+// line.
+func splitGroupedAlias(lineText, prefix, member, newToken string, prefixCol, groupStart, groupEnd int) []moduleEditResult {
+	if groupEnd >= len(lineText) || lineText[groupEnd] != '}' {
+		return nil
+	}
+	var rest []string
+	for _, m := range strings.Split(lineText[groupStart:groupEnd], ",") {
+		if m = strings.TrimSpace(m); m != "" && m != member {
+			rest = append(rest, m)
+		}
+	}
+	span := groupEnd + 1 - prefixCol
+	if len(rest) == 0 {
+		return []moduleEditResult{{prefixCol, span, newToken}}
+	}
+	// The new line repeats what comes before the prefix: the indentation and
+	// the alias, require, or import keyword.
+	replacement := prefix + ".{" + strings.Join(rest, ", ") + "}\n" + lineText[:prefixCol] + newToken
+	return []moduleEditResult{{prefixCol, span, replacement}}
 }
 
 type moduleEditResult struct {
@@ -6547,7 +6635,7 @@ func overlapsClaimed(claimed []moduleEditResult, e moduleEditResult) bool {
 // back from disk. clientRenames have not moved yet — the client applies them
 // when it receives the reply — so their new paths are indexed from the text
 // the edits produce.
-func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles, clientRenames map[string]string) {
+func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles, clientRenames map[string]string) <-chan struct{} {
 	removePaths := make([]string, 0, len(movedFiles)+len(clientRenames))
 	for oldPath := range movedFiles {
 		removePaths = append(removePaths, oldPath)
@@ -6594,7 +6682,7 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles,
 		}
 	}
 
-	mr.server.reindexAfterRename(removePaths, reindexPaths, openReindexes)
+	return mr.server.reindexAfterRename(removePaths, reindexPaths, openReindexes)
 }
 
 type renameSite struct {
@@ -6611,7 +6699,7 @@ type textReindex struct {
 // buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
 // of oldToken with newToken. Open buffers are returned in the WorkspaceEdit;
 // closed files are written directly to disk in parallel goroutines.
-func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *WorkspaceEdit {
+func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, report *RenameSummary) *WorkspaceEdit {
 	// Group sites by file
 	sitesByFile := make(map[string][]renameSite, len(sites))
 	for _, site := range sites {
@@ -6728,8 +6816,14 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	}
 	wg.Wait()
 	s.reportRenameFailures(&failures)
+	for fp := range sitesByFile {
+		if _, ok := fileCache[fp]; ok {
+			report.changed(fp)
+		}
+	}
+	report.recordFailures(&failures)
 
-	s.reindexAfterRename(nil, reindexPaths, openReindexes)
+	report.waitFor(s.reindexAfterRename(nil, reindexPaths, openReindexes))
 
 	return &WorkspaceEdit{Changes: openChanges}
 }
@@ -6738,10 +6832,15 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 // lock. Besides keeping each write out of a cold build, holding the lock across
 // removals and inserts prevents a build from observing an empty intermediate
 // state and starting its insert-only transaction in the middle of the rename.
-func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) {
+//
+// The returned channel is closed when the index shows the rename.
+func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) <-chan struct{} {
+	done := make(chan struct{})
+	s.index.renameIndexed = done // the caller holds renameSerial
 	s.index.backgroundWork.Add(1)
 	go func() {
 		defer s.index.backgroundWork.Done()
+		defer close(done)
 
 		s.index.reindexing.Lock()
 		defer s.index.reindexing.Unlock()
@@ -6769,6 +6868,7 @@ func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths [
 			log.Printf("Rename: reindexed %d files", len(diskPaths)+len(textPaths)) // intentionally always logged — useful for user feedback
 		}
 	}()
+	return done
 }
 
 // isDepsFile returns true if filePath lives under the deps/ directory of some

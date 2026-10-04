@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/remoteoss/dexter/internal/daemon"
 	"github.com/remoteoss/dexter/internal/lsptest"
@@ -952,5 +957,255 @@ func TestIntegration_LegacyMigration(t *testing.T) {
 	out := runDexter(t, binary, root, "lookup", "MyApp.Repo")
 	if !strings.Contains(out, "repo.ex:1") {
 		t.Errorf("expected lookup to work after migration, got: %s", out)
+	}
+}
+
+// mcpConnect spawns `dexter mcp <root>` over stdio and returns a connected
+// MCP client session.
+func mcpConnect(t *testing.T, binary, root string) *sdkmcp.ClientSession {
+	t.Helper()
+	cmd := exec.Command(binary, "mcp", root)
+	cmd.Dir = root
+	cmd.Stderr = os.Stderr
+	// The daemon that the MCP session starts must not outlive the test by the
+	// default idle timeout.
+	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+mustAbs(t, root))
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "integration-test", Version: "0.0.1"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	t.Cleanup(cancel)
+	session, err := client.Connect(ctx, &sdkmcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatalf("connecting to dexter mcp: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	return session
+}
+
+func mcpToolText(t *testing.T, res *sdkmcp.CallToolResult) string {
+	t.Helper()
+	var b strings.Builder
+	for _, c := range res.Content {
+		if tc, ok := c.(*sdkmcp.TextContent); ok {
+			b.WriteString(tc.Text)
+		}
+	}
+	return b.String()
+}
+
+func TestIntegration_MCPStdio(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	session := mcpConnect(t, binary, root)
+	ctx := context.Background()
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, tool := range tools.Tools {
+		names[tool.Name] = true
+	}
+	for _, want := range []string{"dexter_workspace", "dexter_search", "dexter_definition", "dexter_references", "dexter_module_api", "dexter_file_outline", "dexter_implementations", "dexter_call_hierarchy", "dexter_reindex", "dexter_rename_symbol"} {
+		if !names[want] {
+			t.Errorf("tool %s not advertised; got %v", want, names)
+		}
+	}
+
+	res, err := session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "dexter_workspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("dexter_workspace errored: %s", mcpToolText(t, res))
+	}
+	out := mcpToolText(t, res)
+	for _, want := range []string{"Project root:", "mix.exs", "definitions"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("workspace output missing %q:\n%s", want, out)
+		}
+	}
+
+	res, err = session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "dexter_definition", Arguments: map[string]any{"module": "MyApp.Repo", "function": "get"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = mcpToolText(t, res)
+	if !strings.Contains(out, "lib/my_app/repo.ex") {
+		t.Errorf("definition output missing location:\n%s", out)
+	}
+}
+
+func TestIntegration_MCPStdio_EmptyIndexBuildsOnStartup(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	// No `dexter init`: the daemon builds the index, and the tool call waits
+	// for that build.
+
+	session := mcpConnect(t, binary, root)
+	res, err := session.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: "dexter_search", Arguments: map[string]any{"query": "process_event"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := mcpToolText(t, res)
+	if !strings.Contains(out, "MyApp.Handlers.Webhooks.process_event") {
+		t.Errorf("search after auto-index missing symbol:\n%s", out)
+	}
+}
+
+func TestIntegration_MCPInstructions(t *testing.T) {
+	binary := buildDexter(t)
+	out := runDexter(t, binary, t.TempDir(), "mcp", "--instructions")
+	for _, want := range []string{"dexter_workspace", "dexter_reindex", "dexter_rename_symbol"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("instructions missing %q", want)
+		}
+	}
+}
+
+// TestIntegration_MCPSharesWorkspaceDaemon checks that `dexter mcp` is a
+// frontend of the workspace daemon, like the CLI and the editor: it attaches to
+// the one daemon of the workspace, sees changes through the daemon's watcher,
+// and answers from the same index as `dexter lookup`.
+func TestIntegration_MCPSharesWorkspaceDaemon(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	session := mcpConnect(t, binary, root)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "dexter_definition", Arguments: map[string]any{"module": "MyApp.Repo", "function": "get"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := mcpToolText(t, res); !strings.Contains(out, "lib/my_app/repo.ex") {
+		t.Fatalf("definition output missing location:\n%s", out)
+	}
+
+	client, err := daemon.Dial(ctx, root)
+	if err != nil {
+		t.Fatalf("no workspace daemon serves the MCP session: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	status, err := client.DaemonStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The MCP control connection and this one.
+	if status.Clients != 2 {
+		t.Errorf("daemon has %d clients, want 2 (the MCP session and this test)", status.Clients)
+	}
+
+	// Agent edits produce no editor notifications; the daemon's watcher sees
+	// them.
+	createdPath := filepath.Join(root, "lib", "my_app", "created_by_agent.ex")
+	if err := os.WriteFile(createdPath, []byte("defmodule MyApp.CreatedByAgent do\n  def run, do: :ok\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		res, err = session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "dexter_definition", Arguments: map[string]any{"module": "MyApp.CreatedByAgent"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(mcpToolText(t, res), "lib/my_app/created_by_agent.ex") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon's watcher did not index an agent-created file")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The CLI answers from the same daemon and the same index.
+	if out := runDexter(t, binary, root, "lookup", "MyApp.CreatedByAgent"); !strings.Contains(out, "created_by_agent.ex:1") {
+		t.Errorf("CLI lookup does not see the module the MCP session saw: %s", out)
+	}
+	after, err := client.DaemonStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.PID != status.PID {
+		t.Errorf("daemon pid changed from %d to %d: a second daemon served the workspace", status.PID, after.PID)
+	}
+}
+
+// TestIntegration_MCPListenHTTP serves MCP over streamable HTTP and calls a
+// tool, which the workspace daemon answers.
+func TestIntegration_MCPListenHTTP(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	cmd := exec.Command(binary, "mcp", "--listen=localhost:0", root)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+mustAbs(t, root))
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	})
+
+	addrCh := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			if i := strings.Index(scanner.Text(), "MCP server listening on "); i >= 0 {
+				addrCh <- strings.TrimSpace(scanner.Text()[i+len("MCP server listening on "):])
+				break
+			}
+		}
+		// Keep draining so the child never blocks on a full stderr pipe.
+		for scanner.Scan() {
+		}
+	}()
+	var addr string
+	select {
+	case addr = <-addrCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the MCP listen address on stderr")
+	}
+
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "integration-test", Version: "0.0.1"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	session, err := client.Connect(ctx, &sdkmcp.StreamableClientTransport{Endpoint: "http://" + addr}, nil)
+	if err != nil {
+		t.Fatalf("connecting to the MCP HTTP server: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "dexter_definition", Arguments: map[string]any{"module": "MyApp.Repo", "function": "get"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := mcpToolText(t, res); !strings.Contains(out, "lib/my_app/repo.ex") {
+		t.Errorf("definition over HTTP missing location:\n%s", out)
+	}
+}
+
+// Regression: --listen accepted any address, and the server has no
+// authentication, so a wildcard address exposed the code and the rename tool
+// to the network.
+func TestIntegration_MCPListenRefusesNonLoopback(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	cmd := exec.Command(binary, "mcp", "--listen=0.0.0.0:0", root)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("dexter mcp --listen=0.0.0.0:0 started:\n%s", out)
+	}
+	if !strings.Contains(string(out), "refusing to listen") || !strings.Contains(string(out), "--listen-unsafe") {
+		t.Errorf("refusal does not explain itself:\n%s", out)
 	}
 }

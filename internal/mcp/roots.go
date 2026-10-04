@@ -1,0 +1,109 @@
+package mcp
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/remoteoss/dexter/internal/store"
+)
+
+// fileURIToPath converts a file:// URI to a clean absolute filesystem path, so
+// that spellings such as a trailing slash name the same root.
+func fileURIToPath(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid root URI %q: %w", raw, err)
+	}
+	if u.Host != "" && u.Host != "localhost" {
+		return "", fmt.Errorf("root URI %q names a remote host", raw)
+	}
+	path := filepath.Clean(filepath.FromSlash(uriPath(u.Path, runtime.GOOS)))
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("root URI %q has no absolute path", raw)
+	}
+	return path, nil
+}
+
+// uriPath returns the filesystem form of a file URI's path. On Windows,
+// file:///C:/project carries the drive letter after a leading slash.
+func uriPath(p, goos string) string {
+	if goos == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' && isDriveLetter(p[1]) {
+		return p[1:]
+	}
+	return p
+}
+
+func isDriveLetter(c byte) bool {
+	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+}
+
+// negotiatedRoot resolves a session's workspace root from the MCP roots the
+// client advertises. ok is false when the client offers no usable root (no
+// roots capability, an empty list, or no file:// root): callers fall back to
+// the launch-directory root. A transport failure, or file:// roots that are
+// all unusable, is an error the caller should surface and retry, not cache.
+//
+// A usable root goes through resolve, which finds the project root the same
+// way for every frontend. The spelling the client used is kept: the daemon
+// indexes paths in the spelling of the frontend that started it, and refuses
+// other spellings of the same directory.
+func negotiatedRoot(ctx context.Context, ss *mcp.ServerSession, resolve func(string) (string, error)) (root string, ok bool, err error) {
+	params := ss.InitializeParams()
+	if params == nil || params.Capabilities == nil || params.Capabilities.RootsV2 == nil {
+		return "", false, nil
+	}
+	res, err := ss.ListRoots(ctx, nil)
+	if err != nil {
+		return "", false, fmt.Errorf("listing client roots: %w", err)
+	}
+	// The first usable file:// root wins. An unusable one (a stale or deleted
+	// directory, a file) is skipped, so it cannot hide a usable root after
+	// it; when no file:// root is usable, the first error is reported.
+	var firstErr error
+	for _, r := range res.Roots {
+		if !strings.HasPrefix(r.URI, "file:") {
+			continue
+		}
+		root, err := usableRoot(r.URI, resolve)
+		if err == nil {
+			return root, true, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return "", false, firstErr
+	}
+	return "", false, nil
+}
+
+func usableRoot(uri string, resolve func(string) (string, error)) (string, error) {
+	path, err := fileURIToPath(uri)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("client root %q is not a directory", path)
+	}
+	return resolve(path)
+}
+
+// defaultResolveRoot finds the project root above dir with the store's marker
+// search (an existing index, then a repository), and refuses a directory that
+// is not a project.
+func defaultResolveRoot(dir string) (string, error) {
+	root := store.FindProjectRoot(dir)
+	if err := store.NonProjectRootError(root); err != nil {
+		return "", err
+	}
+	return root, nil
+}

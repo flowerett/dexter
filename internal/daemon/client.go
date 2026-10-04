@@ -367,6 +367,13 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
+		// Tell the daemon, so the request stops waiting and frees its slot.
+		// Best effort: a connection that cannot take it is ending anyway.
+		if cancelParams, err := json.Marshal(CancelParams{ID: id}); err == nil {
+			c.writeMu.Lock()
+			_ = writeJSONLine(c.conn, request{Method: MethodCancel, Params: cancelParams})
+			c.writeMu.Unlock()
+		}
 		return ctx.Err()
 	}
 }
@@ -433,6 +440,10 @@ func (c *Client) WorkspaceStatus(ctx context.Context, waitReadyMs int) (Workspac
 	err := c.Call(ctx, MethodWorkspaceStatus, StatusParams{WaitReadyMs: waitReadyMs}, &status)
 	return status, err
 }
+
+// Done is closed when the connection ends, for example because the daemon
+// exited. A long-lived frontend uses it to know that it must connect again.
+func (c *Client) Done() <-chan struct{} { return c.readLoopDone }
 
 // Close closes the control connection.
 func (c *Client) Close() error {

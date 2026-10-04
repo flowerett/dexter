@@ -6730,7 +6730,7 @@ end`)
 		}
 	}()
 
-	server.buildTextEdits([]renameSite{{filePath: path, line: 2}}, "old_name", "new_name")
+	server.buildTextEdits([]renameSite{{filePath: path, line: 2}}, "old_name", "new_name", nil)
 	done := make(chan struct{})
 	go func() {
 		server.index.backgroundWork.Wait()

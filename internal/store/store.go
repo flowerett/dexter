@@ -1282,6 +1282,29 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 	return results, rows.Err()
 }
 
+// ListModuleCallbacks returns the @callback and @macrocallback definitions of
+// the given behaviour module (these are excluded from ListModuleFunctions).
+func (s *Store) ListModuleCallbacks(module string) ([]CompletionResult, error) {
+	rows, err := s.db.Query(
+		"SELECT d.module, d.function, d.arity, d.kind, f.path, d.line, d.params FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.kind IN ('callback', 'macrocallback') GROUP BY d.function, d.arity ORDER BY d.function, d.arity LIMIT 100",
+		module,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CompletionResult
+	for rows.Next() {
+		var r CompletionResult
+		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line, &r.Params); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
 // IndexStats summarizes the size of the index.
 type IndexStats struct {
 	Files       int

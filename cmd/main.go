@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"github.com/remoteoss/dexter/internal/daemon"
 	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/lsp"
+	dexter_mcp "github.com/remoteoss/dexter/internal/mcp"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
@@ -153,6 +156,30 @@ func main() {
 		},
 	}
 
+	var mcpListen string
+	var mcpListenUnsafe bool
+	var mcpInstructions bool
+	mcpCmd := &cobra.Command{
+		Use:   "mcp [path]",
+		Short: "Start the MCP server (stdio)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if mcpInstructions {
+				fmt.Print(dexter_mcp.Instructions)
+				return nil
+			}
+			projectRoot, err := resolvePath(args, 0)
+			if err != nil {
+				return err
+			}
+			cmdMCP(projectRoot, mcpListen, mcpListenUnsafe, len(args) > 0 || rootDir != "")
+			return nil
+		},
+	}
+	mcpCmd.Flags().StringVar(&mcpListen, "listen", "", "Serve MCP over streamable HTTP on this loopback address instead of stdio")
+	mcpCmd.Flags().BoolVar(&mcpListenUnsafe, "listen-unsafe", false, "Allow --listen on an address that other machines can reach (the server has no authentication)")
+	mcpCmd.Flags().BoolVar(&mcpInstructions, "instructions", false, "Print the MCP instructions file and exit")
+
 	var daemonIdleTimeout time.Duration
 	daemonCmd := &cobra.Command{
 		Use:    "daemon <path>",
@@ -184,7 +211,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, lspCmd, daemonCmd, versionCmd)
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, lspCmd, mcpCmd, daemonCmd, versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -244,6 +271,20 @@ func findProjectRootWithMissing(path string, allowMissing bool) string {
 	if err != nil {
 		fatal(err)
 	}
+	return projectRootIn(path, info)
+}
+
+// projectRootFor is findProjectRoot for a frontend that must not exit on an
+// error, such as the MCP server resolving a root that a client gave.
+func projectRootFor(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	return projectRootIn(path, info), nil
+}
+
+func projectRootIn(path string, info os.FileInfo) string {
 	if !info.IsDir() {
 		path = filepath.Dir(path)
 	}
@@ -279,16 +320,9 @@ func requireProjectRoot(dir string, allowNonProject bool) {
 	if allowNonProject {
 		return
 	}
-	if store.IsHomeDir(dir) {
-		if store.HasIndex(dir) {
-			return
-		}
-		fatal(fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project\nhint: run from a project, pass --root <path>, or pass -y/--yes if you really mean it", dir))
+	if err := store.NonProjectRootError(dir); err != nil {
+		fatal(fmt.Errorf("%w\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", err))
 	}
-	if store.LooksLikeProject(dir) {
-		return
-	}
-	fatal(fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or Dexter database found, so it does not look like an Elixir project\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", dir))
 }
 
 // defaultIdleTimeout resolves the daemon idle timeout. DEXTER_DAEMON_IDLE_TIMEOUT
@@ -717,4 +751,100 @@ func formatInt(n int) string {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(1)
+}
+
+// mcpConfig resolves the MCP frontend's workspace roots. The fallback root and
+// the roots that clients give go through the same project-root search as the
+// CLI, so every frontend reaches the same daemon for one directory.
+func mcpConfig(launchDir string, explicitRoot bool) (dexter_mcp.Config, error) {
+	root, err := projectRootFor(launchDir)
+	if err != nil {
+		return dexter_mcp.Config{}, err
+	}
+	cfg := dexter_mcp.Config{Root: root, Fixed: explicitRoot, ResolveRoot: mcpClientRoot}
+	if !explicitRoot {
+		// The launch directory is only a guess at the workspace. Starting a
+		// daemon on a directory that is not a project would index all of it.
+		if err := store.NonProjectRootError(root); err != nil {
+			cfg.FallbackErr = fmt.Errorf("%w. The MCP client gave no workspace root; configure the server with the project path (`dexter mcp <path>`) or start it in the project", err)
+		}
+	}
+	return cfg, nil
+}
+
+// mcpClientRoot resolves a directory that an MCP client gives as a root, with
+// the same refusal as the launch directory: a client root that is not a
+// project, or that is the home directory, would start a daemon that indexes
+// all of it. The MCP frontend treats a refused root as unusable.
+func mcpClientRoot(dir string) (string, error) {
+	root, err := projectRootFor(dir)
+	if err != nil {
+		return "", err
+	}
+	if err := store.NonProjectRootError(root); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+// cmdMCP serves MCP to an agent. Like `dexter lsp`, it is a frontend of the
+// shared workspace daemon: it opens no index and starts no watcher, and every
+// tool call is answered by the daemon of the session's workspace, which it
+// starts when necessary. Logs go to stderr; stdout belongs to the MCP stdio
+// transport.
+//
+// With an explicit path (or --root) every session uses that workspace.
+// Without one, each session's root is negotiated through MCP roots and
+// resolved like the CLI resolves its own, with the launch directory as the
+// fallback for clients that give no root.
+func cmdMCP(projectRoot string, listen string, listenUnsafe bool, explicitRoot bool) {
+	log.SetOutput(os.Stderr)
+	if listen != "" {
+		if err := dexter_mcp.CheckListenAddr(listen, listenUnsafe); err != nil {
+			fatal(err)
+		}
+	} else if listenUnsafe {
+		fatal(fmt.Errorf("--listen-unsafe needs --listen"))
+	}
+	cfg, err := mcpConfig(projectRoot, explicitRoot)
+	if err != nil {
+		fatal(err)
+	}
+	root := cfg.Root
+	frontend := dexter_mcp.NewFrontend(cfg)
+	defer frontend.Close()
+	if explicitRoot {
+		log.Printf("Dexter MCP v%s starting (root: %s, daemon log: %s)", version.Version, root, daemonLogPath(root))
+	} else {
+		log.Printf("Dexter MCP v%s starting (workspace roots negotiated per session; fallback root: %s)", version.Version, root)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if listen != "" {
+		ln, err := net.Listen("tcp", listen)
+		if err != nil {
+			fatal(err)
+		}
+		log.Printf("MCP server listening on %s", ln.Addr())
+		if err := dexter_mcp.CheckListenAddr(listen, false); err != nil {
+			log.Printf("WARNING: --listen-unsafe: the MCP server on %s has no authentication; anyone who can reach it can read this code and rename symbols", ln.Addr())
+		}
+		httpSrv := &http.Server{Handler: dexter_mcp.HTTPHandler(frontend), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutdownCtx)
+		}()
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			fatal(err)
+		}
+		return
+	}
+
+	if err := dexter_mcp.RunStdio(ctx, frontend); err != nil && ctx.Err() == nil {
+		fatal(err)
+	}
 }
