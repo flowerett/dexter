@@ -330,16 +330,7 @@ func TestServer_ApplyDefinitionStyle(t *testing.T) {
 	}
 }
 
-// --- Duplicate-location reproductions (issue #38, knoebber's follow-up) ---
-//
-// knoebber reported that Zed's goto-definition opens the references picker even
-// when "the function is defined once in another module", implying Dexter is
-// returning more than one Location in cases where a human sees a single
-// definition. These tests pin the scenarios we suspect: each asserts exactly 1
-// Location from Definition(). A failure here means the handler is returning
-// duplicates for a single-definition call and likely reproduces the bug.
-
-// Sanity baseline: one def, one caller — must be a single Location.
+// A call with a single matching definition returns exactly one location.
 func TestDefinition_SingleDef_ReturnsOneLocation(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -365,9 +356,7 @@ end
 	}
 }
 
-// Multi-arity: def foo/1 and def foo/2 both defined once each. A call to foo/1
-// should only return the foo/1 line — but LookupFunction ignores arity, so we
-// expect this to currently return 2 locations (the bug).
+// A call returns only the definition matching its arity.
 func TestDefinition_MultiArity_ReturnsOneLocation(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -391,8 +380,7 @@ end
 	// Cursor on "square" in MyApp.Math.square(3)
 	locs := definitionAt(t, server, callerURI, 1, 28)
 	if len(locs) != 1 {
-		t.Fatalf("expected exactly 1 location for square/1 call, got %d — "+
-			"LookupFunction is not filtering by arity: %+v", len(locs), locs)
+		t.Fatalf("expected 1 location for square/1, got %d: %+v", len(locs), locs)
 	}
 }
 
@@ -573,10 +561,7 @@ end
 	}
 }
 
-// defdelegate + def with the same name in the same module. The caller writes
-// Mod.do_thing(x); the human reads this as "one definition" (the delegate) but
-// LookupFollowDelegate returns both the defdelegate line and the def line
-// because allDelegates is false.
+// A defdelegate and a def sharing a name resolve to the one matching the call.
 func TestDefinition_DelegateAndDefSameName_ReturnsOneLocation(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -605,15 +590,11 @@ end
 	// Cursor on "do_thing" in MyApp.Api.do_thing("hello")
 	locs := definitionAt(t, server, callerURI, 1, 27)
 	if len(locs) != 1 {
-		t.Fatalf("expected exactly 1 location for delegate-then-def call, got %d — "+
-			"LookupFollowDelegate returns both the defdelegate and def rows: %+v", len(locs), locs)
+		t.Fatalf("expected 1 location for do_thing/1, got %d: %+v", len(locs), locs)
 	}
 }
 
-// Multiple heads of the same arity — the original PR #39 scenario. This is
-// *not* a bug; it's what Jesse called "a feature". The test documents the
-// current behavior: all heads returned with style="all", only first with
-// style="first".
+// Same-arity heads: "all" returns every head, "first" only the first.
 func TestDefinition_MultipleHeadsSameArity_StyleControlled(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
