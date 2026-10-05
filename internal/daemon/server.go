@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/notify"
 	"github.com/remoteoss/dexter/internal/version"
 	"github.com/remoteoss/dexter/internal/workspace"
 )
@@ -63,7 +64,18 @@ const (
 	MethodReindex         = "workspace/reindex"
 	MethodWatch           = "workspace/watch"
 	MethodUnwatch         = "workspace/unwatch"
+
+	// MethodCancel cancels one in-flight request of the same connection, like
+	// $/cancelRequest in LSP. It is sent with id 0 and gets no response; the
+	// canceled request still answers, usually with a context error, and the
+	// client has stopped waiting for it.
+	MethodCancel = "$/cancel"
 )
+
+// CancelParams names the request that MethodCancel cancels.
+type CancelParams struct {
+	ID uint64 `json:"id"`
+}
 
 // Status describes the daemon serving a workspace.
 type Status struct {
@@ -96,6 +108,29 @@ type WorkspaceStatus struct {
 	Definitions          int             `json:"definitions"`
 	References           int             `json:"references"`
 	Sessions             []SessionStatus `json:"sessions,omitempty"`
+	// Conditions are the failures and degraded states that are active now,
+	// the same ones that attached editors see.
+	Conditions []Note `json:"conditions,omitempty"`
+}
+
+// Note is one active condition of the workspace, for a frontend that cannot
+// show LSP messages. Key names the condition (for example "index.rebuild");
+// Severity is "error", "warning", or "info".
+type Note struct {
+	Key      string `json:"key,omitempty"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+func notesFrom(conditions []notify.Condition) []Note {
+	if len(conditions) == 0 {
+		return nil
+	}
+	out := make([]Note, len(conditions))
+	for i, c := range conditions {
+		out[i] = Note{Key: c.Key, Severity: c.Severity.String(), Message: c.Message}
+	}
+	return out
 }
 
 // StatusParams optionally waits for the initial reconciliation before
@@ -120,18 +155,21 @@ type LookupParams struct {
 }
 
 // LookupResult travels in the location encoding described at locationsWire.
+// Notes are the active conditions of the index, such as a rebuild, so that a
+// result from an incomplete index is not taken as complete.
 type LookupResult struct {
 	Locations []lsp.NameLocation
 	Ready     bool
+	Notes     []Note
 }
 
 func (r LookupResult) MarshalJSON() ([]byte, error) {
-	return marshalLocations(r.Locations, r.Ready)
+	return marshalLocations(r.Locations, r.Ready, r.Notes)
 }
 
 func (r *LookupResult) UnmarshalJSON(data []byte) error {
 	var err error
-	r.Locations, r.Ready, err = unmarshalLocations(data)
+	r.Locations, r.Ready, r.Notes, err = unmarshalLocations(data)
 	return err
 }
 
@@ -146,15 +184,16 @@ type ReferencesParams struct {
 type ReferencesResult struct {
 	Locations []lsp.NameLocation
 	Ready     bool
+	Notes     []Note
 }
 
 func (r ReferencesResult) MarshalJSON() ([]byte, error) {
-	return marshalLocations(r.Locations, r.Ready)
+	return marshalLocations(r.Locations, r.Ready, r.Notes)
 }
 
 func (r *ReferencesResult) UnmarshalJSON(data []byte) error {
 	var err error
-	r.Locations, r.Ready, err = unmarshalLocations(data)
+	r.Locations, r.Ready, r.Notes, err = unmarshalLocations(data)
 	return err
 }
 
@@ -167,6 +206,7 @@ type locationsWire struct {
 	Files     []string       `json:"files"`
 	Locations []locationWire `json:"locations"`
 	Ready     bool           `json:"ready"`
+	Notes     []Note         `json:"notes,omitempty"`
 }
 
 type locationWire struct {
@@ -177,11 +217,12 @@ type locationWire struct {
 	Declaration bool   `json:"declaration,omitempty"`
 }
 
-func marshalLocations(locations []lsp.NameLocation, ready bool) ([]byte, error) {
+func marshalLocations(locations []lsp.NameLocation, ready bool, notes []Note) ([]byte, error) {
 	wire := locationsWire{
 		Files:     []string{},
 		Locations: make([]locationWire, len(locations)),
 		Ready:     ready,
+		Notes:     notes,
 	}
 	fileIndex := make(map[string]int)
 	for i, location := range locations {
@@ -202,15 +243,15 @@ func marshalLocations(locations []lsp.NameLocation, ready bool) ([]byte, error) 
 	return json.Marshal(wire)
 }
 
-func unmarshalLocations(data []byte) ([]lsp.NameLocation, bool, error) {
+func unmarshalLocations(data []byte) ([]lsp.NameLocation, bool, []Note, error) {
 	var wire locationsWire
 	if err := json.Unmarshal(data, &wire); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	locations := make([]lsp.NameLocation, len(wire.Locations))
 	for i, location := range wire.Locations {
 		if location.File < 0 || location.File >= len(wire.Files) {
-			return nil, false, fmt.Errorf("location %d names file %d of %d", i, location.File, len(wire.Files))
+			return nil, false, nil, fmt.Errorf("location %d names file %d of %d", i, location.File, len(wire.Files))
 		}
 		locations[i] = lsp.NameLocation{
 			FilePath:      wire.Files[location.File],
@@ -220,7 +261,7 @@ func unmarshalLocations(data []byte) ([]lsp.NameLocation, bool, error) {
 			IsDeclaration: location.Declaration,
 		}
 	}
-	return locations, wire.Ready, nil
+	return locations, wire.Ready, wire.Notes, nil
 }
 
 type ReindexParams struct {
@@ -234,6 +275,8 @@ type ReindexResult struct {
 	// already matches the disk, and the watcher may simply have pruned a
 	// deleted file first. A mistyped path is the usual cause.
 	Missing bool `json:"missing,omitempty"`
+	// Notes are the active conditions of the index after the reindex.
+	Notes []Note `json:"notes,omitempty"`
 }
 
 // WatchParams subscribes a connection to coalesced index mutations.
@@ -547,6 +590,11 @@ type conn struct {
 	sem      chan struct{}
 	requests sync.WaitGroup
 
+	// inflight maps the id of each running request to the cancel func of its
+	// context, for MethodCancel.
+	inflightMu sync.Mutex
+	inflight   map[uint64]context.CancelFunc
+
 	writeMu sync.Mutex
 	subsMu  sync.Mutex
 	subs    map[string]func()
@@ -740,7 +788,7 @@ func (s lspStream) Close() error                { return s.conn.Close() }
 // serveControl handles requests concurrently so a long reindex cannot block a
 // lookup, and serializes only the writes.
 func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) error {
-	mc := MethodContext{
+	base := MethodContext{
 		Context: c.ctx,
 		Runtime: s.runtime,
 		Session: sessionID,
@@ -753,6 +801,15 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 		if err := readJSONLine(reader, &req); err != nil {
 			return err
 		}
+		if req.Method == MethodCancel {
+			// Handled on the reader, outside the request limit, so a cancel
+			// gets through when every slot is taken.
+			var params CancelParams
+			if err := json.Unmarshal(req.Params, &params); err == nil {
+				c.cancelRequest(params.ID)
+			}
+			continue
+		}
 		select {
 		case c.sem <- struct{}{}:
 		case <-c.ctx.Done():
@@ -762,6 +819,12 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 			continue
 		}
 		c.requests.Add(1)
+		// Each request has its own context, so a cancel ends its waits and
+		// frees its slot before the connection ends.
+		mc := base
+		var cancel context.CancelFunc
+		mc.Context, cancel = context.WithCancel(c.ctx)
+		c.trackRequest(req.ID, cancel)
 		go func(req request) {
 			res := response{ID: req.ID}
 			defer func() {
@@ -776,6 +839,8 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 					log.Printf("Daemon control method %q: %v", req.Method, err)
 					_ = c.write(response{ID: req.ID, Error: fmt.Sprintf("%s result is too large to send (%d bytes, limit %d); narrow the query", req.Method, len(res.Result), maxProtocolLine)})
 				}
+				c.untrackRequest(req.ID)
+				cancel()
 				<-c.sem
 				c.requests.Done()
 			}()
@@ -789,6 +854,30 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 				}
 			}
 		}(req)
+	}
+}
+
+func (c *conn) trackRequest(id uint64, cancel context.CancelFunc) {
+	c.inflightMu.Lock()
+	if c.inflight == nil {
+		c.inflight = make(map[uint64]context.CancelFunc)
+	}
+	c.inflight[id] = cancel
+	c.inflightMu.Unlock()
+}
+
+func (c *conn) untrackRequest(id uint64) {
+	c.inflightMu.Lock()
+	delete(c.inflight, id)
+	c.inflightMu.Unlock()
+}
+
+func (c *conn) cancelRequest(id uint64) {
+	c.inflightMu.Lock()
+	cancel := c.inflight[id]
+	c.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -838,6 +927,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			Root: st.Root, Ready: st.Ready, Watching: st.Watching, StdlibRoot: st.StdlibRoot,
 			IndexVersion: st.IndexVersion, ExpectedIndexVersion: st.ExpectedIndexVersion,
 			Files: st.Files, Definitions: st.Definitions, References: st.References,
+			Conditions: notesFrom(s.runtime.Reporter().Conditions()),
 		}
 		for _, sess := range s.runtime.Sessions() {
 			out.Sessions = append(out.Sessions, SessionStatus{
@@ -861,7 +951,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		if err != nil {
 			return nil, err
 		}
-		return LookupResult{Locations: locations, Ready: s.runtime.IsReady()}, err
+		return LookupResult{Locations: locations, Ready: s.runtime.IsReady(), Notes: notesFrom(s.runtime.IndexConditions())}, err
 	case MethodReferences:
 		var params ReferencesParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -875,7 +965,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		if err != nil {
 			return nil, err
 		}
-		return ReferencesResult{Locations: locations, Ready: s.runtime.IsReady()}, err
+		return ReferencesResult{Locations: locations, Ready: s.runtime.IsReady(), Notes: notesFrom(s.runtime.IndexConditions())}, err
 	case MethodReindex:
 		var params ReindexParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -897,7 +987,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			}
 			err = s.runtime.ReindexPath(mc.Context, params.Target)
 		}
-		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond), Missing: missing}, err
+		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond), Missing: missing, Notes: notesFrom(s.runtime.IndexConditions())}, err
 	case MethodWatch:
 		var params WatchParams
 		if len(req.Params) > 0 {
@@ -925,7 +1015,9 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 // the only watchers, so a frontend uses this instead of watching the tree again.
 func (s *server) watch(c *conn, mc MethodContext, params WatchParams) (any, error) {
 	changes, cancel := s.runtime.Subscribe(params.Buffer)
-	ctx, stop := context.WithCancel(mc.Context)
+	// The subscription outlives the request that made it: it ends with the
+	// connection or an unwatch.
+	ctx, stop := context.WithCancel(c.ctx)
 	id := c.addSub(func() {
 		stop()
 		cancel()

@@ -367,6 +367,13 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
+		// Tell the daemon, so the request stops waiting and frees its slot.
+		// Best effort: a connection that cannot take it is ending anyway.
+		if cancelParams, err := json.Marshal(CancelParams{ID: id}); err == nil {
+			c.writeMu.Lock()
+			_ = writeJSONLine(c.conn, request{Method: MethodCancel, Params: cancelParams})
+			c.writeMu.Unlock()
+		}
 		return ctx.Err()
 	}
 }
@@ -433,6 +440,10 @@ func (c *Client) WorkspaceStatus(ctx context.Context, waitReadyMs int) (Workspac
 	err := c.Call(ctx, MethodWorkspaceStatus, StatusParams{WaitReadyMs: waitReadyMs}, &status)
 	return status, err
 }
+
+// Done is closed when the connection ends, for example because the daemon
+// exited. A long-lived frontend uses it to know that it must connect again.
+func (c *Client) Done() <-chan struct{} { return c.readLoopDone }
 
 // Close closes the control connection.
 func (c *Client) Close() error {
@@ -796,9 +807,16 @@ func spawn(root string) error {
 	return nil
 }
 
-// ProxyLSP connects stdio to a daemon-hosted LSP session.
+// ProxyLSP connects stdio to a daemon-hosted LSP session. When the session
+// cannot start, the editor must not see only a process that exits: ProxyLSP
+// answers its initialize request with the explanation and returns an
+// *LSPStartupError.
 func ProxyLSP(ctx context.Context, root string, in io.Reader, out io.Writer) error {
-	return ProxyFrontend(ctx, root, kindLSP, "", in, out)
+	conn, reader, err := connectFrontend(ctx, root, kindLSP, "")
+	if err != nil {
+		return failLSPStartup(ctx, root, err, in, out)
+	}
+	return pipeFrontend(conn, reader, in, out)
 }
 
 // ProxyFrontend connects stdio to a daemon-hosted protocol adapter without
@@ -806,19 +824,35 @@ func ProxyLSP(ctx context.Context, root string, in io.Reader, out io.Writer) err
 // a copy rather than a parse. session names an editor session the adapter should
 // share overlays with; empty means headless.
 func ProxyFrontend(ctx context.Context, root, kind, session string, in io.Reader, out io.Writer) error {
+	conn, reader, err := connectFrontend(ctx, root, kind, session)
+	if err != nil {
+		return err
+	}
+	return pipeFrontend(conn, reader, in, out)
+}
+
+// connectFrontend starts the daemon when necessary and opens one frontend
+// stream to it.
+func connectFrontend(ctx context.Context, root, kind, session string) (net.Conn, *bufio.Reader, error) {
 	// A control connection starts the daemon and verifies it is accepting.
 	// Closing it before opening the frontend stream is safe because the
 	// daemon's idle timeout is not zero.
 	client, err := Ensure(ctx, root)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	_ = client.Close()
 
 	conn, reader, _, err := dialKind(ctx, root, kind, session)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
+	return conn, reader, nil
+}
+
+// pipeFrontend copies bytes both ways until the daemon side ends, and closes
+// the connection.
+func pipeFrontend(conn net.Conn, reader *bufio.Reader, in io.Reader, out io.Writer) error {
 	defer func() { _ = conn.Close() }()
 
 	type closeWriter interface{ CloseWrite() error }

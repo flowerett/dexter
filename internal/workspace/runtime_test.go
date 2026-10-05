@@ -13,6 +13,7 @@ import (
 	"go.lsp.dev/protocol"
 
 	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
 
@@ -174,6 +175,154 @@ func readChange(t *testing.T, changes <-chan Change) Change {
 		t.Fatal("timed out waiting for an index change")
 	}
 	return Change{}
+}
+
+// A manifest change in a nested worktree belongs to that checkout, not to this
+// workspace, so it must not start a workspace reindex.
+func TestManifestInNestedWorktreeDoesNotReindexWorkspace(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	makeLinkedWorktree(t, root, wt)
+	manifest := filepath.Join(wt, "mix.exs")
+	if err := os.WriteFile(manifest, []byte("defmodule Feature.MixProject do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No event reports this file, so only a workspace reindex can index it.
+	writeTestModule(t, root, "lib/unreported.ex", "SharedLib.Unreported")
+
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.Unreported") != 0 {
+		t.Fatal("a nested worktree's mix.exs reindexed the workspace")
+	}
+}
+
+// cp -r can copy a worktree's files before its .git file, so some can be indexed
+// first. When the watcher reports the directory, those rows go.
+func TestDirectoryThatBecomesWorktreeLosesItsRows(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, "copied")
+	early := writeTestModule(t, wt, "lib/early.ex", "SharedLib.Early")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), early); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.Early") == 0 {
+		t.Fatal("setup: the early file was not indexed")
+	}
+	makeLinkedWorktree(t, root, wt)
+	main := filepath.Join(root, "lib", "main.ex")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), main); err != nil {
+		t.Fatal(err)
+	}
+	// The watcher reports the directory itself, which is not a full reindex.
+	if err := rt.awaitPath(testContext(t, 10*time.Second), wt); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.Early") != 0 {
+		t.Fatal("rows indexed before the .git file appeared are still there")
+	}
+	if countModule(t, rt, "Main") == 0 {
+		t.Fatal("rows outside the worktree went too")
+	}
+}
+
+// An index built before nested worktrees were skipped holds their files. They
+// still exist on disk, so the sweep must remove them for another reason.
+func TestReindexRemovesRowsFromNestedWorktree(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	old := writeTestModule(t, wt, "lib/old.ex", "SharedLib.OldCopy")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), old); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") == 0 {
+		t.Fatal("setup: the worktree file was not indexed")
+	}
+	makeLinkedWorktree(t, root, wt)
+	if err := rt.Reindex(testContext(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") != 0 {
+		t.Fatal("the sweep kept a row from a nested worktree")
+	}
+	if countModule(t, rt, "Main") == 0 {
+		t.Fatal("the sweep did not index the project")
+	}
+}
+
+// git worktree remove deletes the .git file before the rest of the checkout,
+// and its record last. A sweep in between must drop rows from the worktree, not
+// keep them because the files still exist.
+func TestReindexRemovesRowsFromWorktreeBeingRemoved(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	old := writeTestModule(t, wt, "lib/old.ex", "SharedLib.OldCopy")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), old); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") == 0 {
+		t.Fatal("setup: the worktree file was not indexed")
+	}
+	makeLinkedWorktree(t, root, wt)
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Reindex(testContext(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") != 0 {
+		t.Fatal("the sweep kept a row from a worktree that git still records")
+	}
+	if countModule(t, rt, "Main") == 0 {
+		t.Fatal("the sweep did not index the project")
+	}
+}
+
+// In a linked worktree, .git is a file and HEAD is in the git directory it
+// names. A branch switch there must still reconcile the workspace.
+func TestGitWatchFollowsLinkedWorktreeHead(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	previous := gitHeadPollInterval
+	gitHeadPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { gitHeadPollInterval = previous })
+
+	base := t.TempDir()
+	admin := filepath.Join(base, "app", ".git", "worktrees", "feature")
+	head := filepath.Join(admin, "HEAD")
+	root := filepath.Join(base, "feature")
+	for path, content := range map[string]string{
+		head:                              "ref: refs/heads/feature\n",
+		filepath.Join(admin, "commondir"): "../..\n",
+		filepath.Join(root, ".git"):       "gitdir: " + admin + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rt, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	if err := rt.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	changes, cancel := rt.Subscribe(8)
+	defer cancel()
+
+	later := time.Now().Add(time.Minute)
+	if err := os.Chtimes(head, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if change := readChange(t, changes); !change.Full {
+		t.Fatalf("change = %+v, want a full reconcile", change)
+	}
 }
 
 // An isolated editor save must not pay the coalescing window: that window exists
@@ -567,5 +716,137 @@ func TestWatchCoverageTransitionsTriggerOneFullReconcileEach(t *testing.T) {
 	case change := <-changes:
 		t.Fatalf("coverage transitions caused a recurring change: %+v", change)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// Close cancels the initial reconciliation instead of waiting for it, so a
+// daemon that is told to stop releases its workspace lock at once. The pass it
+// cancels leaves a consistent index, and the next open finishes it.
+func TestCloseCancelsInitialReconcileAndReopenFinishes(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	root := t.TempDir()
+	writeTestModule(t, root, "lib/seed.ex", "MyApp.Seed")
+	rt, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const files = 2000
+	for i := 0; i < files; i++ {
+		writeTestModule(t, root, fmt.Sprintf("lib/gen/mod%d.ex", i), fmt.Sprintf("MyApp.Gen%d", i))
+	}
+
+	rt, err = OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("Close took %s during the initial reconciliation", took)
+	}
+
+	rt, err = OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	if err := rt.WaitReady(testContext(t, 60*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := rt.Store().ListFilePathsUnder(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != files+1 {
+		t.Errorf("after reopen: %d project files indexed, want %d", len(paths), files+1)
+	}
+	for _, module := range []string{"MyApp.Seed", "MyApp.Gen0", fmt.Sprintf("MyApp.Gen%d", files-1)} {
+		if got := countModule(t, rt, module); got != 1 {
+			t.Errorf("%s: %d definitions after reopen, want 1", module, got)
+		}
+	}
+}
+
+// A removal that is queued or running when Close starts is canceled with the
+// rest of the index work, so a large removal (a rebuild of the symbol tables)
+// cannot hold shutdown. The rows it did not remove stay consistent, and the
+// next open prunes them.
+func TestCloseCancelsQueuedRemoval(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	gone := filepath.Join(root, "lib", "gone")
+	for i := 0; i < 20; i++ {
+		writeTestModule(t, root, fmt.Sprintf("lib/gone/mod%d.ex", i), fmt.Sprintf("MyApp.Gone%d", i))
+	}
+	if err := rt.Reindex(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := countModule(t, rt, "MyApp.Gone3"); got != 1 {
+		t.Fatalf("MyApp.Gone3 indexed %d times before the removal, want 1", got)
+	}
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the mutation loop at the removal until Close has started.
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	testHookReconcilePath = func(path string) {
+		if path == gone {
+			close(reached)
+			<-release
+		}
+	}
+	t.Cleanup(func() { testHookReconcilePath = nil })
+	rt.RemoveFile(gone)
+	<-reached
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- rt.Close() }()
+	time.Sleep(100 * time.Millisecond) // Close cancels index work first
+	close(release)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("Close took %s", took)
+	}
+	testHookReconcilePath = nil
+
+	// The canceled removal left the rows of the deleted files.
+	s, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	under, err := s.ListFilePathsUnder(gone)
+	_ = s.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(under) != 20 {
+		t.Errorf("%d rows under the removed directory after Close, want 20 (the removal was not canceled)", len(under))
+	}
+
+	// The next open prunes them.
+	reopened, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if err := reopened.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := countModule(t, reopened, "MyApp.Gone3"); got != 0 {
+		t.Errorf("MyApp.Gone3 still indexed after reopen: %d", got)
 	}
 }

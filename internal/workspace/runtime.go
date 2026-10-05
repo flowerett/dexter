@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/notify"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -52,6 +53,7 @@ type event struct {
 // external ownership lock.
 type Runtime struct {
 	root  string
+	hook  func()
 	store *store.Store
 	index *lsp.IndexCoordinator
 	core  *lsp.Server
@@ -65,6 +67,7 @@ type Runtime struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	coverageMu   sync.Mutex // orders coverage reports; see reportCoverage
 	watcherMu    sync.RWMutex
 	watcher      *Watcher
 	watcherReady chan struct{}
@@ -90,6 +93,11 @@ type Options struct {
 	// requests; it just does not observe the tree itself. Tests use it to drive
 	// the mutation queue deterministically.
 	NoWatch bool
+
+	// BeforeInitialReconcile runs on the mutation loop before the first
+	// reconciliation. Tests use it to hold a workspace in that state, for
+	// example to attach an editor while a rebuild is in progress.
+	BeforeInitialReconcile func()
 }
 
 // Open creates and starts a workspace runtime with native watching enabled.
@@ -101,12 +109,16 @@ func Open(root string) (*Runtime, error) { return OpenWithOptions(root, Options{
 // OpenWithOptions creates and starts a workspace runtime. Open must only be
 // called by the process holding the workspace's ownership lock.
 func OpenWithOptions(root string, opts Options) (*Runtime, error) {
-	s, err := openStore(root)
+	index := lsp.NewIndexCoordinator()
+	reporter := index.Reporter()
+	// Before the store opens: opening it creates the database, which is
+	// itself a project marker.
+	reportRoot(root, reporter)
+	s, err := openStore(root, reporter)
 	if err != nil {
 		return nil, err
 	}
 
-	index := lsp.NewIndexCoordinator()
 	previousStdlibRoot, _ := s.GetStdlibRoot()
 	stdlibRoot := ""
 	if resolved, ok := stdlib.Resolve(s, "", root); ok {
@@ -117,11 +129,13 @@ func OpenWithOptions(root string, opts Options) (*Runtime, error) {
 		ManageWorkspace:   false,
 		InitialStdlibRoot: stdlibRoot,
 	})
+	core.ReportStdlib()
 	if previousStdlibRoot != "" && previousStdlibRoot != stdlibRoot {
 		core.RemoveFilesUnderRoot(previousStdlibRoot)
 	}
 	r := &Runtime{
 		root:         root,
+		hook:         opts.BeforeInitialReconcile,
 		store:        s,
 		index:        index,
 		core:         core,
@@ -208,6 +222,40 @@ func (r *Runtime) Session(id string) (*lsp.Server, bool) {
 	return s.server, true
 }
 
+// EditorBuffer is a buffer that an attached editor holds open with changes it
+// has not saved.
+type EditorBuffer struct {
+	Text      string
+	ChangedAt time.Time // the time of the last change in the editor
+}
+
+// UnsavedBuffer returns the newest buffer for path that an attached editor
+// holds open with unsaved changes, or false when there is none. A frontend
+// without an editor, such as MCP, uses it to read what the user is editing
+// instead of the disk. A buffer the editor has not changed since it opened or
+// saved it is not returned: it can be older than the disk.
+func (r *Runtime) UnsavedBuffer(path string) (EditorBuffer, bool) {
+	r.sessMu.Lock()
+	if len(r.sessions) == 0 {
+		r.sessMu.Unlock()
+		return EditorBuffer{}, false
+	}
+	servers := make([]*lsp.Server, 0, len(r.sessions))
+	for _, s := range r.sessions {
+		servers = append(servers, s.server)
+	}
+	r.sessMu.Unlock()
+	var out EditorBuffer
+	var newest uint64
+	found := false
+	for _, srv := range servers {
+		if t, seq, at, ok := srv.UnsavedBuffer(path); ok && (!found || seq > newest) {
+			out, newest, found = EditorBuffer{Text: t, ChangedAt: at}, seq, true
+		}
+	}
+	return out, found
+}
+
 // SessionInfo describes one attached editor session for status output.
 type SessionInfo struct {
 	ID            string
@@ -233,6 +281,22 @@ func newSessionTag() string {
 		return fmt.Sprintf("%06x", time.Now().UnixNano()&0xffffff)
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// Reporter returns the reporter that tells every attached editor about
+// failures, degraded states, and long work in this workspace.
+func (r *Runtime) Reporter() *notify.Reporter { return r.index.Reporter() }
+
+// IndexConditions returns the active conditions that describe the index, such
+// as a rebuild or an index that cannot be used. The CLI prints them.
+func (r *Runtime) IndexConditions() []notify.Condition {
+	var out []notify.Condition
+	for _, c := range r.Reporter().Conditions() {
+		if strings.HasPrefix(c.Key, lsp.IndexConditionPrefix) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // Store returns the workspace index. Frontends read through it instead of
@@ -483,6 +547,9 @@ func (r *Runtime) send(ev event) bool {
 func (r *Runtime) loop() {
 	defer r.loopWG.Done()
 	<-r.watcherReady
+	if r.hook != nil {
+		r.hook()
+	}
 	r.core.ReindexWorkspace()
 	r.publish(Change{Full: true})
 	close(r.ready)
@@ -596,31 +663,51 @@ func (r *Runtime) publishBatch(full bool, paths map[string]struct{}) {
 	r.publish(c)
 }
 
+// testHookReconcilePath, when set by a test, runs before each path event is
+// reconciled.
+var testHookReconcilePath func(path string)
+
 func (r *Runtime) reconcilePath(path string) error {
+	if testHookReconcilePath != nil {
+		testHookReconcilePath(path)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			paths := []string{path}
-			stored, listErr := r.store.ListFilePaths()
+			under, listErr := r.store.ListFilePathsUnder(path)
 			if listErr != nil {
 				return listErr
 			}
-			prefix := path + string(os.PathSeparator)
-			for _, storedPath := range stored {
-				if strings.HasPrefix(storedPath, prefix) {
-					paths = append(paths, storedPath)
-				}
-			}
-			r.core.RemoveFiles(paths)
+			r.core.RemoveFiles(append(under, path))
 			return nil
 		}
 		return err
 	}
 	if info.IsDir() {
+		// A watcher reports a directory when it turns out to be a nested
+		// worktree. Files indexed from it before its .git file appeared, as cp -r
+		// can do, are removed with one range read of the path index.
+		// A worktree that git is still moving counts too: its .git file can
+		// be empty when the watcher reports it.
+		if path != r.root && parser.GitFile(path).Nested() {
+			under, err := r.store.ListFilePathsUnder(path)
+			if err != nil {
+				return err
+			}
+			if len(under) > 0 {
+				r.core.RemoveFiles(under)
+			}
+		}
 		return nil
 	}
 	base := filepath.Base(path)
 	if base == "mix.lock" || base == "mix.exs" {
+		// A nested worktree is a separate checkout the index leaves out, so its
+		// manifests must not reindex this workspace. Source files need no check
+		// here: the core skips them itself.
+		if parser.InLinkedWorktree(r.root, path) {
+			return nil
+		}
 		r.core.ReindexWorkspace()
 		return nil
 	}
@@ -630,10 +717,17 @@ func (r *Runtime) reconcilePath(path string) error {
 	return nil
 }
 
-// Close stops event sources, drains accepted mutations, waits for background
-// index work, checkpoints, and closes the store.
+// Close cancels a reconciliation in flight, stops event sources, drains
+// accepted mutations, waits for background index work, checkpoints, and closes
+// the store.
+//
+// The cancel comes first. A warm pass over a large change set can run for
+// minutes, and the daemon holds the workspace lock without serving its socket
+// until Close returns. A canceled pass leaves every file fully old or fully new,
+// and the next start finishes it from the stored mtimes.
 func (r *Runtime) Close() error {
 	r.closeOnce.Do(func() {
+		r.index.CancelWork()
 		close(r.watcherStop)
 		r.watcherWG.Wait()
 		<-r.watcherReady
@@ -666,15 +760,19 @@ func (r *Runtime) startNativeWatcher() {
 	for {
 		started := time.Now()
 		watcher, err := startNativeWatch(r.root, WatchCallbacks{
-			PathChanged:     r.ReconcileFile,
-			FullReconcile:   func() { r.send(event{kind: eventFull}) },
-			CoverageChanged: r.watchCoverageChanged,
+			PathChanged:   r.ReconcileFile,
+			FullReconcile: func() { r.send(event{kind: eventFull}) },
+			CoverageChanged: func(degraded bool) {
+				r.reportCoverage()
+				r.watchCoverageChanged(degraded)
+			},
 		})
 		if err == nil {
 			r.watcherMu.Lock()
 			r.watcher = watcher
 			r.watcherMu.Unlock()
 			log.Printf("Workspace watcher %s started in %s", watcher.Kind(), time.Since(started).Round(time.Millisecond))
+			r.reportWatcherStarted(watcher)
 			if firstAttempt {
 				close(r.watcherReady)
 			} else {
@@ -682,7 +780,7 @@ func (r *Runtime) startNativeWatcher() {
 			}
 			return
 		}
-		log.Printf("Warning: native file watching unavailable for %s: %v", r.root, err)
+		r.reportWatchUnavailable(err)
 		if firstAttempt {
 			close(r.watcherReady)
 			firstAttempt = false
@@ -699,8 +797,17 @@ func (r *Runtime) startNativeWatcher() {
 	}
 }
 
+// gitHeadPollInterval is how often the runtime checks HEAD for a branch switch.
+var gitHeadPollInterval = 2 * time.Second
+
 func (r *Runtime) startGitWatch() {
-	headPath := filepath.Join(r.root, ".git", "HEAD")
+	// In a linked worktree or a submodule, .git is a file that names the git
+	// directory, and HEAD is there.
+	gitDir, ok := parser.GitDir(r.root)
+	if !ok {
+		return
+	}
+	headPath := filepath.Join(gitDir, "HEAD")
 	info, err := os.Stat(headPath)
 	if err != nil {
 		return
@@ -709,7 +816,7 @@ func (r *Runtime) startGitWatch() {
 	r.gitWG.Add(1)
 	go func() {
 		defer r.gitWG.Done()
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(gitHeadPollInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -730,25 +837,94 @@ func (r *Runtime) startGitWatch() {
 	}()
 }
 
-func openStore(root string) (*store.Store, error) {
-	s, err := store.Open(root)
+// openBusyWait bounds how long openStore waits for another process to release
+// a locked index. Each attempt also waits out the store's own busy timeout. A
+// variable so tests can shrink it.
+var openBusyWait = 30 * time.Second
+
+// openStore opens the index. It deletes the index for a rebuild only when that
+// is safe and useful: when the file is damaged, or when it was written by
+// another index version. Each rebuild is a condition that the first
+// reconciliation clears.
+//
+// A locked index is never deleted. Another process, such as `dexter init` or an
+// older Dexter release, can hold it in a write transaction, and deleting the
+// files under it loses its work in silence. openStore waits for the lock, and
+// fails when it stays, so that the editor shows why. Permission, disk-space,
+// and similar errors do not delete either: a rebuild cannot fix them.
+func openStore(root string, reporter *notify.Reporter) (*store.Store, error) {
+	s, err := openWaitingForLock(root, reporter)
 	if err != nil {
-		log.Printf("Failed to open index at %s (%v); rebuilding derived index", root, err)
-		removeIndexFiles(root)
-		if s, err = store.Open(root); err != nil {
-			return nil, fmt.Errorf("opening index at %s: %w", root, err)
+		switch store.ClassifyOpenError(err) {
+		case store.OpenFailureDamaged:
+			reporter.Set(lsp.CondIndexRebuild, notify.Warning, damagedIndexMessage(root, err))
+			removeIndexFiles(root)
+			if s, err = store.Open(root); err != nil {
+				return nil, openFailed(reporter, otherOpenFailureMessage(root, err), err)
+			}
+		case store.OpenFailureBusy:
+			return nil, openFailed(reporter, lockedIndexMessage(root, err), err)
+		default:
+			return nil, openFailed(reporter, otherOpenFailureMessage(root, err), err)
 		}
 	}
 	if stored := s.GetIndexVersion(); stored != version.IndexVersion && !s.IsEmpty() {
+		reporter.Set(lsp.CondIndexRebuild, notify.Warning, versionMismatchMessage(stored, version.IndexVersion))
 		if err := s.Close(); err != nil {
 			return nil, fmt.Errorf("closing outdated index: %w", err)
 		}
 		removeIndexFiles(root)
 		if s, err = store.Open(root); err != nil {
-			return nil, fmt.Errorf("reopening index at %s: %w", root, err)
+			return nil, openFailed(reporter, otherOpenFailureMessage(root, err), err)
 		}
 	}
 	return s, nil
+}
+
+// openWaitingForLock opens the store and retries while another process holds
+// it locked, up to openBusyWait.
+func openWaitingForLock(root string, reporter *notify.Reporter) (*store.Store, error) {
+	deadline := time.Now().Add(openBusyWait)
+	backoff := 100 * time.Millisecond
+	waited := false
+	for {
+		s, err := store.Open(root)
+		if err == nil {
+			if waited {
+				reporter.Clear(lsp.CondIndexUnavailable, "Dexter: the other process released the index; Dexter continues.")
+			}
+			return s, nil
+		}
+		if store.ClassifyOpenError(err) != store.OpenFailureBusy || !time.Now().Before(deadline) {
+			return nil, err
+		}
+		if !waited {
+			waited = true
+			reporter.Set(lsp.CondIndexUnavailable, notify.Error, fmt.Sprintf(
+				"Dexter: another process holds the index at %s locked (%v). Dexter waits up to %s for it and does not change the index.",
+				store.DBPath(root), err, openBusyWait))
+		}
+		time.Sleep(backoff)
+		if backoff < time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// openIndexError is an index that could not be opened. Its text is the
+// message for the user: the daemon exits with it, and a frontend shows the end
+// of the daemon log in the editor.
+type openIndexError struct {
+	message string
+	err     error
+}
+
+func (e *openIndexError) Error() string { return strings.TrimPrefix(e.message, "Dexter: ") }
+func (e *openIndexError) Unwrap() error { return e.err }
+
+func openFailed(reporter *notify.Reporter, message string, err error) error {
+	reporter.Set(lsp.CondIndexUnavailable, notify.Error, message)
+	return &openIndexError{message: message, err: err}
 }
 
 func removeIndexFiles(root string) {

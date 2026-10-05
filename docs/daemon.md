@@ -2,19 +2,19 @@
 
 Dexter runs one daemon per workspace. The daemon is the only process that opens
 the workspace index for normal operation and the only owner of filesystem and Git
-watchers. LSP and ordinary CLI processes are frontends that connect to it over a
-local socket; the MCP frontend will attach the same way.
+watchers. LSP, MCP, and ordinary CLI processes are frontends that connect to it over a
+local socket.
 
-Implementation status: the daemon serves the LSP frontend and the `lookup`,
-`references`, `reindex`, and `stop` commands. MCP is designed for but not
-migrated yet — see [The MCP frontend](#the-mcp-frontend).
+Implementation status: the daemon serves the LSP frontend, the MCP frontend
+(`dexter mcp`, see [The MCP frontend](#the-mcp-frontend)), and the `lookup`,
+`references`, `reindex`, and `stop` commands.
 
 `dexter init` remains an offline maintenance command. It acquires the same
 workspace ownership lock as the daemon, asks an idle daemon to exit, and refuses
 to run while a daemon with attached clients owns the workspace. There is no
 in-process editor mode: the daemon belongs to the workspace, and an editor that
-served the index itself would be one more owner competing with the CLI — and,
-once it lands, MCP — for the same caches and the same writer.
+served the index itself would be one more owner competing with the CLI and
+MCP for the same caches and the same writer.
 
 ## Goals
 
@@ -33,7 +33,7 @@ once it lands, MCP — for the same caches and the same writer.
 ```text
 editor <-> dexter lsp --stdio proxy --\
                                       local socket <-> workspace daemon
-MCP frontend (planned) -------------/                   |
+MCP frontend (dexter mcp) ----------/                   |
 CLI lookup/references/reindex -------/                   +-- SQLite store
                                                           +-- mutation queue
                                                           +-- file/Git watchers
@@ -55,7 +55,11 @@ another process holds would let a second daemon take ownership of the same index
 Every connection starts with a small versioned handshake carrying the workspace
 *identity*, the connection kind, and the frontend's `ContractVersion`. Identity
 is the symlink-resolved root, and it decides which daemon owns the physical
-workspace. The root the daemon *indexes* keeps the spelling its starter used,
+workspace. On macOS it also takes the case that the file system stores
+(`F_GETPATH`), because the default file system ignores case and
+`filepath.EvalSymlinks` keeps the case the caller typed: without it,
+`~/Code/app` and `~/code/app` would get two locks and two daemons that build
+one index at the same time. The root the daemon *indexes* keeps the spelling its starter used,
 because stored paths are matched against the URIs an editor sends: canonicalizing
 them would break every path-keyed lookup for a project reached through a symlink
 (on macOS a temp dir is `/var/...` to the editor and `/private/var/...` after
@@ -73,6 +77,15 @@ responses carry an id, and the daemon may push notifications (a method, no id)
 between them. One connection therefore multiplexes concurrent calls and
 subscriptions, and a slow reindex cannot block a lookup.
 
+A connection runs at most 64 requests at once; one more is refused at once
+instead of blocking the reader. Each request has its own context, derived from
+the connection's. A client that stops waiting for a request sends
+`{"id":0,"method":"$/cancel","params":{"id":N}}`, the pattern of LSP's
+`$/cancelRequest`: the reader handles it outside the request limit and cancels
+request `N`, so its index waits end and its slot is free again. The canceled
+request still answers; the client has dropped it. A subscription made by
+`workspace/watch` belongs to the connection, not to the request that made it.
+
 Each message is one line of at most 16 MiB, newline included. A writer refuses
 a longer line before sending anything, so the stream stays in step: a result
 that is too large fails only its own call, and a `workspace/changed`
@@ -88,7 +101,10 @@ sending each path once:
 ```
 
 `file` indexes `files`, and the locations keep their result order. `kind`,
-`arity`, and `declaration` are omitted when empty, zero, or false.
+`arity`, and `declaration` are omitted when empty, zero, or false. A result
+from an index that is being rebuilt or cannot be used also carries
+`"notes":[{"severity":"warning","message":"..."}]`, the same text an editor
+shows; the field is omitted when no index condition is active.
 
 ## The restart contract
 
@@ -113,6 +129,14 @@ On a mismatch the newer side wins, and the daemon does the moving:
   those on their own terms or not at all.
 - With nobody to notice, the idle timeout is the fallback: the daemon exits on
   its own and the next frontend starts the current build.
+
+A `dexter lsp` proxy that cannot attach for any of these reasons, or for any
+other startup error, does not only print to stderr: it reads the editor's
+`initialize` request, sends `window/showMessage` (Error) with the explanation
+and the fix, answers `initialize` with JSON-RPC error -32603 that carries the
+same text, and exits. An editor that is older than the daemon is told to
+restart from the current binary; a daemon that cannot be replaced, a root
+spelling mismatch, and a workspace held by `dexter init` get their own fix.
 
 ## Ownership and crash recovery
 
@@ -211,6 +235,10 @@ once when coverage is lost, retries only failed registrations, and reconciles
 after each restored subtree to catch changes made during its gap. Failure to
 create the native watcher is retried the same way. There is no periodic full-tree
 reindex, so a persistent kernel watch limit does not cause recurring CPU spikes.
+Each of these states (no native watching, the fsnotify fallback, directories
+that cannot be watched) is a condition in the workspace reporter: every attached
+editor sees it, an editor that attaches later receives it, and the user is told
+when coverage comes back. See "Telling the user" in `docs/architecture.md`.
 
 ## Lifecycle
 
@@ -265,76 +293,88 @@ Built-in control surface:
 |---|---|
 | `daemon/status` | pid, version, protocol, readiness, client count, uptime, registered frontends |
 | `daemon/shutdown` | exit when no other client is attached; refuse otherwise |
-| `workspace/status` | readiness, watcher state, stdlib root, index version and size, attached sessions; `waitReadyMs` turns it into an index barrier |
+| `workspace/status` | readiness, watcher state, stdlib root, index version and size, attached sessions, active failure and degraded conditions; `waitReadyMs` turns it into an index barrier |
 | `workspace/lookup` | module/function lookup with the CLI's non-strict module fallback |
 | `workspace/references` | semantic references through the shared language service |
 | `workspace/reindex` | whole workspace or one path, returning after the barrier |
 | `workspace/watch`, `workspace/unwatch` | subscribe to coalesced index changes, pushed as `workspace/changed` notifications |
+| `$/cancel` | cancel one in-flight request of this connection; sent with id 0, no response |
 
 ## The MCP frontend
 
-MCP is not migrated onto the daemon yet. Its server still carries its own copy of
-workspace ownership: a store handle, a headless `lsp.Server`, stdlib discovery,
-a filesystem watcher, a Git HEAD poll, an initial index pass, and an index barrier.
-The daemon exists so those can be deleted rather than duplicated a second time.
-The table below is the mapping that migration applies, and the sections after it
-are the design it should follow.
+`dexter mcp` keeps the MCP protocol server in the frontend process (over stdio,
+or streamable HTTP with `--listen`) and reaches the workspace through one
+registered control method, `mcp/tool`. It opens no store, starts no watcher, and
+runs no LSP lifecycle of its own.
 
-| MCP-side concept | Daemon equivalent |
-|---|---|
-| `binding.init`, `openStore` recovery | `workspace.Open` (same recovery path) |
-| `binding.lsp = lsp.NewServer(...)` | `Runtime.LanguageServices()` |
-| `stdlib.Resolve` + `SetStdlibRoot` | resolved once by the runtime, inherited by sessions |
-| `WatchFiles` (own watcher) | `workspace.Watcher` → one mutation queue |
-| `lsp.WatchGitHead` | `Runtime.startGitWatch` |
-| `binding.awaitIndex`, `indexWaitLimit` | `workspace/status` with `waitReadyMs` |
-| `binding.close` | close the connection; the daemon idles out |
-| `mcp.Config{LSP, Store, ProjectRoot}` | `Runtime.LanguageServices()/Store/Root` accessors |
+- **Roots.** Multi-root negotiation stays in the frontend. Each MCP session's
+  root comes from MCP roots, resolved with the same project-root search as the
+  CLI, or from the command line. Sessions that resolve to the same root share
+  one control connection (`daemon.Ensure`), which is the lease that keeps the
+  daemon alive; the connection closes when the last such session ends. The
+  frontend keeps the spelling the client gave. When the daemon already serves
+  the workspace through another spelling, the frontend uses the daemon's root.
+- **Tools.** `internal/mcp` registers `mcp/tool` at package initialization. A
+  call carries the tool name, its arguments, and `waitReadyMs`. The daemon runs
+  the tool body against `mc.LSP()` (the headless language service, since MCP
+  never names an editor session) and the runtime's store. One method instead
+  of one per tool keeps each tool's parameter type in one place, shared by the
+  input schema the agent sees and the body that decodes it. Definitions and
+  references use `LookupName` and `ReferenceNames`, the same name navigation as
+  the editor and the CLI.
+- **Cold and degraded index.** A tool waits up to `waitReadyMs` (capped at
+  30 s) for the initial reconciliation, then answers from what is indexed. An
+  answer from an index that is still building, or that has an active warning
+  or error condition, ends with a note that says so. The rename tool refuses
+  until the index is complete, because a rename from a partial index would
+  change some call sites and leave others with the old name.
+- **Editor buffers.** Tools that read file text (outlines, definition and
+  module docs, reference lines) use the newest buffer that an attached editor
+  session holds open with unsaved changes: the editor changed it after its
+  last open or save (`didChange` after `didOpen`/`didSave`). A buffer with no
+  unsaved changes can be older than the disk (an editor that has not reloaded
+  the file after an agent wrote it), so the disk is used. When the file on
+  disk changed after the buffer's last change, the disk is used too, and the
+  answer warns that the editor's unsaved changes may conflict. The answer
+  names the files that came from unsaved buffers. The index positions refer
+  to the saved file, so a line is mapped into the buffer with a line diff
+  (Myers, line endings ignored; bounded, with a fallback to the lines that
+  both texts share at the start and at the end); a position on a changed line
+  shows the saved line, marked as such. Paths that the
+  agent gives must be inside the project root after symlinks are resolved, and
+  must name a regular file of at most 10 MB.
+- **Limits and cancellation.** One frontend runs at most 32 tool calls at once
+  on a workspace connection, below the daemon's 64, and a call past the limit
+  waits for a slot. A call that the MCP client cancels sends `$/cancel`, so the
+  daemon stops waiting for the index for it. A canceled rename says that it may
+  have been applied. When the client's roots change to another project during
+  a call, the call ends with an error that says so.
+- **HTTP.** `--listen` accepts only a loopback address unless
+  `--listen-unsafe` is given, because the server has no authentication. The
+  SDK refuses a non-loopback `Host` on a loopback connection (DNS rebinding),
+  cross-origin browser requests are refused, a request body over 4 MB gets
+  413, and a session with no request for 30 minutes is closed, so a client
+  that went away does not keep its daemon alive.
+- **Reconnects.** When the daemon goes away (an upgrade replaced it, or
+  `dexter stop --force`; a plain `dexter stop` is refused while MCP is
+  attached), the next tool call connects again, which starts a new daemon.
+  A read-only call that was in flight is sent once more; a rename is never
+  repeated.
+- **Rename.** The rename runs on the headless language service and writes the
+  changed files on disk. It does not yet look at buffers that an editor attached
+  to the same daemon has open. The shared rule for frontends without an editor
+  (never write over unsaved editor work; refuse with an actionable error when an
+  affected file has unsaved changes) will replace the call in
+  `internal/mcp/rename.go` when it lands in `internal/lsp`.
 
-### Two ways to attach
+A daemon-hosted frontend (`RegisterFrontend("mcp", ...)`, with the MCP server
+inside the daemon) would save the local round trip per tool call. It needs an
+SDK `Transport` over the socket, which tracks SDK internals, and the round trip
+is noise next to the model latency that caused the call. Revisit it only if the
+per-call latency becomes measurable.
 
-Both shapes are reachable through the registries above, and they are not equally
-cheap. Neither is wired up yet. The MCP Go SDK speaks JSON-RPC over an `io.ReadWriteCloser`, but its
-`InMemoryTransport` keeps that field unexported and `newIOConn` is internal, so
-there is no supported way to hand it a raw socket.
-
-**Control methods (recommended).** Keep the MCP protocol server in the frontend
-process over stdio, exactly as it is today, and reach the workspace through
-control calls. Register one method per tool backend —
-`workspace/definition`, `workspace/rename`, `workspace/callHierarchy`,
-`workspace/implementations`, `workspace/outline`, `workspace/moduleAPI`,
-`workspace/search` — each a thin wrapper over the equivalent `internal/lsp/api.go`
-call made against `mc.LSP()`. The frontend's per-root binding becomes
-`daemon.Ensure(ctx, root)`; its index barrier becomes `client.WorkspaceStatus(ctx,
-waitReadyMs)`; its watcher becomes `client.Watch(ctx, buffer, onChange)`;
-its `close` becomes `client.Close()`. The cost is one local JSON round trip per
-tool call, which is noise next to the model latency that triggered the call, and
-it needs no transport work and no SDK coupling. Multi-root negotiation stays in
-the frontend: one control connection per negotiated root.
-
-**Daemon-hosted frontend.** `RegisterFrontend("mcp", ...)` plus
-`daemon.ProxyFrontend(ctx, root, "mcp", session, os.Stdin, os.Stdout)` would run
-the MCP server inside the daemon, so tool calls never cross a socket and
-`fc.LSP()` gives attached mode the editor's unsaved buffers. It requires
-implementing the SDK's `Transport`/`Connection` pair over the socket — about the
-same newline-delimited JSON framing the LSP stream already avoids by proxying
-bytes — and that implementation tracks SDK internals. Worth revisiting only if
-per-call latency ever becomes measurable, or if the SDK grows a constructor that
-wraps an `io.ReadWriteCloser`.
-
-Rules for that work:
-
-- Attach per root. One daemon per negotiated workspace root, one control
-  connection each; the daemon itself does not become multi-root.
-- Reach name-based operations through `Runtime.LanguageServices()`, or through the
-  attached editor session when the client explicitly named one. Add
-  protocol-neutral methods to the runtime, or register a control method, rather
-  than implementing queries in an adapter.
-- Never open the store, start a watcher, or run a second LSP lifecycle in the
-  frontend process.
-- Gate a cold workspace with `workspace/status` instead of a private barrier.
-- Bump `ContractVersion` when a wire change breaks an older frontend, and treat
-  method names and payload shapes as the adapter contract.
+Bump `ContractVersion` when a change to `mcp/tool` breaks an older frontend; the
+method name and payload shapes are part of the adapter contract.
 
 ## Performance requirements
 
@@ -344,8 +384,7 @@ behind the mutation coordinator.
 
 Benchmarks should cover warm definition/hover/completion latency, daemon startup,
 CLI lookup, large reference responses, event-to-index latency, concurrent reads
-during a reindex, and total memory/CPU with LSP and MCP connected together (MCP
-once it is migrated).
+during a reindex, and total memory/CPU with LSP and MCP connected together.
 
 The target for the daemon hop is no more than 1 ms added p95 latency for hot LSP
 operations. `cmd/lspprobe` measures a real project over the wire; calling the

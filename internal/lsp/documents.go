@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_elixir "github.com/tree-sitter/tree-sitter-elixir/bindings/go"
@@ -31,7 +33,19 @@ type cachedDoc struct {
 	// LRU and evicted once the transient cap is reached. Editor-owned
 	// entries (created via Set) are never transient and never evicted.
 	transient bool
+	// seq orders editor-owned entries across every store in the process:
+	// the higher one was set later. A frontend without an editor uses it to
+	// pick the newest unsaved buffer when several editors hold one file.
+	seq uint64
+	// dirty is true when the editor changed the buffer after its last open
+	// or save, at changedAt. A clean buffer can be older than the disk (an
+	// editor that has not reloaded yet), so only a dirty one is unsaved work.
+	dirty     bool
+	changedAt time.Time
 }
+
+// docSeq numbers editor-owned entries; see cachedDoc.seq.
+var docSeq atomic.Uint64
 
 // refTree wraps a tree-sitter parse tree with refcounting so that
 // concurrent handlers walking the tree (RootNode, queries) aren't racing
@@ -144,7 +158,32 @@ func (ds *DocumentStore) Set(uri string, text string) {
 	}
 	// Editor took ownership of this URI - drop any LRU tracking for it.
 	ds.removeFromLRULocked(uri)
-	ds.docs[uri] = &cachedDoc{text: text}
+	ds.docs[uri] = &cachedDoc{text: text, seq: docSeq.Add(1)}
+}
+
+// SetChanged is Set for an edit in the editor: the buffer has unsaved changes
+// until MarkSaved.
+func (ds *DocumentStore) SetChanged(uri string, text string) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if ds.closed {
+		return
+	}
+	if doc, ok := ds.docs[uri]; ok {
+		doc.tree.retireLocked()
+	}
+	ds.removeFromLRULocked(uri)
+	ds.docs[uri] = &cachedDoc{text: text, seq: docSeq.Add(1), dirty: true, changedAt: time.Now()}
+}
+
+// MarkSaved records that the editor saved the buffer, so it has no unsaved
+// changes.
+func (ds *DocumentStore) MarkSaved(uri string) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if doc, ok := ds.docs[uri]; ok && !doc.transient {
+		doc.dirty = false
+	}
 }
 
 func (ds *DocumentStore) Close(uri string) {
@@ -204,6 +243,19 @@ func (ds *DocumentStore) GetIfOpen(uri string) (string, bool) {
 		return "", false
 	}
 	return doc.text, true
+}
+
+// UnsavedBuffer returns an editor-owned entry that has changes the editor has
+// not saved, with its sequence number (see cachedDoc.seq) and the time of its
+// last change.
+func (ds *DocumentStore) UnsavedBuffer(uri string) (text string, seq uint64, changedAt time.Time, ok bool) {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	doc, found := ds.docs[uri]
+	if !found || doc.transient || !doc.dirty {
+		return "", 0, time.Time{}, false
+	}
+	return doc.text, doc.seq, doc.changedAt, true
 }
 
 // GetOrLoad returns the text for the given URI, falling back to a disk

@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1332,6 +1333,17 @@ func TestFindProjectRoot(t *testing.T) {
 		}
 	})
 
+	t.Run("nested linked worktree does not climb to the main checkout's index", func(t *testing.T) {
+		root := mktree(t, []string{".dexter/dexter.db", ".git/HEAD", "wt/lib/foo.ex"})
+		wt := filepath.Join(root, "wt")
+		if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+filepath.Join(root, ".git", "worktrees", "wt")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := FindProjectRoot(filepath.Join(wt, "lib"), "mix.exs"); got != wt {
+			t.Errorf("got %q, want %q", got, wt)
+		}
+	})
+
 	t.Run("wrong marker types are ignored", func(t *testing.T) {
 		root := mktree(t, []string{".dexter/dexter.db/", ".dexter.db/", "mix.exs/", "lib/"})
 		start := filepath.Join(root, "lib")
@@ -1856,6 +1868,73 @@ func TestSetBulkPragmas_AppliesWhenExclusive(t *testing.T) {
 	}
 }
 
+func TestListModuleCallbacks(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/notifier.ex", `defmodule MyApp.Notifier do
+  @callback deliver(map()) :: :ok | {:error, term()}
+  @callback name() :: String.t()
+  @macrocallback render(term()) :: Macro.t()
+  def dispatch(msg), do: msg
+end
+`)
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := s.ListModuleCallbacks("MyApp.Notifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("callbacks = %d, want 3: %+v", len(results), results)
+	}
+	kinds := make(map[string]string, len(results))
+	for _, result := range results {
+		kinds[result.Function] = result.Kind
+	}
+	if kinds["deliver"] != "callback" || kinds["render"] != "macrocallback" {
+		t.Errorf("callback kinds = %v", kinds)
+	}
+}
+
+func TestStats(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	stats, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 0 || stats.Definitions != 0 || stats.References != 0 {
+		t.Errorf("empty store stats = %+v, want zeros", stats)
+	}
+
+	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule SharedLib.Worker do
+  def run, do: MyApp.Accounts.fetch_user(1)
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 1 || stats.Definitions < 2 || stats.References < 1 {
+		t.Errorf("populated store stats = %+v", stats)
+	}
+}
+
 // ModuleFunctionKeys must return the complete set. Callers diff it against
 // another source of truth, so the 100-row cap ListModuleFunctions applies for
 // completion would silently make every function past the cap look unindexed.
@@ -1983,5 +2062,30 @@ func TestHasPathMatchesFilesAndDirectoriesOnly(t *testing.T) {
 		if got != want {
 			t.Errorf("HasPath(%s) = %v, want %v", relative, got, want)
 		}
+	}
+}
+
+// ListFilePathsUnder returns exactly the files below a directory, not siblings
+// that only share its name as a prefix.
+func TestListFilePathsUnder(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	for _, relative := range []string{"lib/a.ex", "lib/sub/b.ex", "lib.ex", "lib0/c.ex", "libx/d.ex"} {
+		if err := s.IndexFile(writeElixirFile(t, dir, relative, ""), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListFilePathsUnder(filepath.Join(dir, "lib"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(got)
+	want := []string{filepath.Join(dir, "lib/a.ex"), filepath.Join(dir, "lib/sub/b.ex")}
+	if !slices.Equal(got, want) {
+		t.Errorf("ListFilePathsUnder(lib) = %v, want %v", got, want)
+	}
+	if got, _ := s.ListFilePathsUnder(filepath.Join(dir, "lib/a.ex")); len(got) != 0 {
+		t.Errorf("ListFilePathsUnder(file) = %v, want none", got)
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/remoteoss/dexter/internal/daemon"
 	"github.com/remoteoss/dexter/internal/indexer"
+	"github.com/remoteoss/dexter/internal/lsp"
+	dexter_mcp "github.com/remoteoss/dexter/internal/mcp"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
@@ -152,6 +156,30 @@ func main() {
 		},
 	}
 
+	var mcpListen string
+	var mcpListenUnsafe bool
+	var mcpInstructions bool
+	mcpCmd := &cobra.Command{
+		Use:   "mcp [path]",
+		Short: "Start the MCP server (stdio)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if mcpInstructions {
+				fmt.Print(dexter_mcp.Instructions)
+				return nil
+			}
+			projectRoot, err := resolvePath(args, 0)
+			if err != nil {
+				return err
+			}
+			cmdMCP(projectRoot, mcpListen, mcpListenUnsafe, len(args) > 0 || rootDir != "")
+			return nil
+		},
+	}
+	mcpCmd.Flags().StringVar(&mcpListen, "listen", "", "Serve MCP over streamable HTTP on this loopback address instead of stdio")
+	mcpCmd.Flags().BoolVar(&mcpListenUnsafe, "listen-unsafe", false, "Allow --listen on an address that other machines can reach (the server has no authentication)")
+	mcpCmd.Flags().BoolVar(&mcpInstructions, "instructions", false, "Print the MCP instructions file and exit")
+
 	var daemonIdleTimeout time.Duration
 	daemonCmd := &cobra.Command{
 		Use:    "daemon <path>",
@@ -183,7 +211,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, lspCmd, daemonCmd, versionCmd)
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, lspCmd, mcpCmd, daemonCmd, versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -243,11 +271,25 @@ func findProjectRootWithMissing(path string, allowMissing bool) string {
 	if err != nil {
 		fatal(err)
 	}
+	return projectRootIn(path, info)
+}
+
+// projectRootFor is findProjectRoot for a frontend that must not exit on an
+// error, such as the MCP server resolving a root that a client gave.
+func projectRootFor(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	return projectRootIn(path, info), nil
+}
+
+func projectRootIn(path string, info os.FileInfo) string {
 	if !info.IsDir() {
 		path = filepath.Dir(path)
 	}
 	root := store.FindProjectRoot(path, "mix.exs")
-	if home, homeErr := os.UserHomeDir(); homeErr == nil && sameDir(root, home) {
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && store.SameDir(root, home) {
 		if mixRoot := findMarkerBefore(path, "mix.exs", home); mixRoot != "" {
 			return mixRoot
 		}
@@ -256,7 +298,7 @@ func findProjectRootWithMissing(path string, allowMissing bool) string {
 }
 
 func findMarkerBefore(path, marker, stop string) string {
-	for dir := path; !sameDir(dir, stop); dir = filepath.Dir(dir) {
+	for dir := path; !store.SameDir(dir, stop); dir = filepath.Dir(dir) {
 		if info, err := os.Stat(filepath.Join(dir, marker)); err == nil && info.Mode().IsRegular() {
 			return dir
 		}
@@ -266,31 +308,6 @@ func findMarkerBefore(path, marker, stop string) string {
 		}
 	}
 	return ""
-}
-
-// projectMarkers are the cheap signals that a directory is, or carries, a
-// Dexter workspace. They match what store.FindProjectRoot trusts, and an
-// a Dexter marker means an actual database, not an empty directory left by an
-// interrupted operation.
-func looksLikeProjectRoot(dir string) bool {
-	return regularFile(filepath.Join(dir, "mix.exs")) ||
-		gitMarker(filepath.Join(dir, ".git")) ||
-		regularFile(store.DBPath(dir)) ||
-		regularFile(store.LegacyDBPath(dir))
-}
-
-func hasDexterMarker(dir string) bool {
-	return regularFile(store.DBPath(dir)) || regularFile(store.LegacyDBPath(dir))
-}
-
-func regularFile(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular()
-}
-
-func gitMarker(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && (info.IsDir() || info.Mode().IsRegular())
 }
 
 // requireProjectRoot refuses to treat a directory that shows no sign of being
@@ -303,47 +320,9 @@ func requireProjectRoot(dir string, allowNonProject bool) {
 	if allowNonProject {
 		return
 	}
-	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
-		if hasDexterMarker(dir) {
-			return
-		}
-		fatal(fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project\nhint: run from a project, pass --root <path>, or pass -y/--yes if you really mean it", dir))
+	if err := store.NonProjectRootError(dir); err != nil {
+		fatal(fmt.Errorf("%w\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", err))
 	}
-	if looksLikeProjectRoot(dir) {
-		return
-	}
-	fatal(fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or Dexter database found, so it does not look like an Elixir project\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", dir))
-}
-
-// warnProjectRoot is the LSP's version of the same check. An editor, unlike a
-// shell command, is authoritative about what the user opened, and refusing to
-// start would leave them with no language server and only a log line to
-// explain it — so this warns loudly and serves the directory anyway. The warning
-// is written to stderr, which every LSP client keeps in its server log.
-func warnProjectRoot(dir string) {
-	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
-		if hasDexterMarker(dir) {
-			return
-		}
-		log.Printf("Warning: %s is your home directory, not a project; indexing it because the editor asked. Set --root <path> in the editor's dexter command if that is wrong.", dir)
-		return
-	}
-	if looksLikeProjectRoot(dir) {
-		return
-	}
-	log.Printf("Warning: %s does not look like an Elixir project (no mix.exs, .git, or Dexter database); indexing it because the editor asked. Set --root <path> if that is the wrong directory.", dir)
-}
-
-// sameDir reports whether two paths name the same directory. Stat is the
-// authority so a symlinked spelling (or a case-insensitive filesystem) cannot
-// sneak a home directory past the check.
-func sameDir(a, b string) bool {
-	ai, aErr := os.Stat(a)
-	bi, bErr := os.Stat(b)
-	if aErr != nil || bErr != nil {
-		return filepath.Clean(a) == filepath.Clean(b)
-	}
-	return os.SameFile(ai, bi)
 }
 
 // defaultIdleTimeout resolves the daemon idle timeout. DEXTER_DAEMON_IDLE_TIMEOUT
@@ -457,6 +436,7 @@ func cmdReindex(target string, allowNonProject bool) {
 	if err := client.Call(callCtx, daemon.MethodReindex, daemon.ReindexParams{Target: target}, &result); err != nil {
 		fatal(err)
 	}
+	printIndexNotes(result.Notes, queryOptions{})
 	switch {
 	case result.Missing:
 		fmt.Fprintf(os.Stderr, "Nothing to reindex at %s: it does not exist and nothing is indexed there\n", target)
@@ -484,8 +464,9 @@ func cmdLookup(projectRoot string, module string, function string, strict bool, 
 	}, &result); err != nil {
 		fatal(err)
 	}
+	printIndexNotes(result.Notes, opts)
 	if len(result.Locations) == 0 {
-		warnIfIndexBuilding(result.Ready, opts)
+		warnIfIndexBuilding(result.Ready, result.Notes, opts)
 		if strict {
 			os.Exit(1)
 		}
@@ -511,8 +492,9 @@ func cmdReferences(projectRoot string, module string, function string, opts quer
 	}, &result); err != nil {
 		fatal(err)
 	}
+	printIndexNotes(result.Notes, opts)
 	if len(result.Locations) == 0 {
-		warnIfIndexBuilding(result.Ready, opts)
+		warnIfIndexBuilding(result.Ready, result.Notes, opts)
 		fmt.Fprintf(os.Stderr, "No references found for %s", module)
 		if function != "" {
 			fmt.Fprintf(os.Stderr, ".%s", function)
@@ -667,9 +649,13 @@ func cmdStopIncompatible(ctx context.Context, root string, e *daemon.Incompatibl
 // the index, watchers, and language caches are shared with every other
 // frontend. The daemon starts on demand: it belongs to the workspace, not to
 // this editor, the CLI, or any other frontend that happens to reach it first.
+//
+// The daemon checks the root and tells the editor when it does not look like a
+// project. When the proxy cannot attach at all, ProxyLSP has already told the
+// editor why, as the answer to its initialize request; fatal only repeats it on
+// stderr for the editor's log.
 func cmdLSP(projectRoot string) {
 	projectRoot = findProjectRoot(projectRoot)
-	warnProjectRoot(projectRoot)
 	log.SetOutput(os.Stderr)
 	log.Printf("Dexter LSP proxy v%s starting (root: %s, daemon log: %s)", version.Version, projectRoot, daemonLogPath(projectRoot))
 	if err := daemon.ProxyLSP(context.Background(), projectRoot, os.Stdin, os.Stdout); err != nil {
@@ -716,11 +702,35 @@ func (o queryOptions) waitReadyMs() int {
 // control protocol never see it: every response carries `ready`, which is the
 // programmatic way to make the same decision, and the daemon logs any request
 // that actually blocked on the build.
-func warnIfIndexBuilding(ready bool, opts queryOptions) {
+func warnIfIndexBuilding(ready bool, notes []daemon.Note, opts queryOptions) {
 	if ready || opts.quiet || envFlag("DEXTER_QUIET") {
 		return
 	}
+	for _, note := range notes {
+		switch note.Key {
+		case lsp.CondIndexRebuild, lsp.CondIndexUnavailable, lsp.CondIndexFallback:
+			return // printIndexNotes already said why the index is incomplete
+		}
+	}
 	fmt.Fprintln(os.Stderr, "note: the workspace index is still building; re-run shortly for complete results")
+}
+
+// printIndexNotes states on stderr that the index is being rebuilt or cannot
+// be used, the same conditions an editor shows, so that an incomplete answer is
+// not taken as complete. An error is printed even with --quiet: the answer is
+// wrong without it. Info notes are left out; warnIfIndexBuilding covers a
+// first build.
+func printIndexNotes(notes []daemon.Note, opts queryOptions) {
+	quiet := opts.quiet || envFlag("DEXTER_QUIET")
+	for _, note := range notes {
+		message := strings.TrimPrefix(note.Message, "Dexter: ")
+		switch {
+		case note.Severity == "error":
+			fmt.Fprintf(os.Stderr, "error: %s\n", message)
+		case note.Severity == "warning" && !quiet:
+			fmt.Fprintf(os.Stderr, "note: %s\n", message)
+		}
+	}
 }
 
 func formatInt(n int) string {
@@ -741,4 +751,100 @@ func formatInt(n int) string {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(1)
+}
+
+// mcpConfig resolves the MCP frontend's workspace roots. The fallback root and
+// the roots that clients give go through the same project-root search as the
+// CLI, so every frontend reaches the same daemon for one directory.
+func mcpConfig(launchDir string, explicitRoot bool) (dexter_mcp.Config, error) {
+	root, err := projectRootFor(launchDir)
+	if err != nil {
+		return dexter_mcp.Config{}, err
+	}
+	cfg := dexter_mcp.Config{Root: root, Fixed: explicitRoot, ResolveRoot: mcpClientRoot}
+	if !explicitRoot {
+		// The launch directory is only a guess at the workspace. Starting a
+		// daemon on a directory that is not a project would index all of it.
+		if err := store.NonProjectRootError(root); err != nil {
+			cfg.FallbackErr = fmt.Errorf("%w. The MCP client gave no workspace root; configure the server with the project path (`dexter mcp <path>`) or start it in the project", err)
+		}
+	}
+	return cfg, nil
+}
+
+// mcpClientRoot resolves a directory that an MCP client gives as a root, with
+// the same refusal as the launch directory: a client root that is not a
+// project, or that is the home directory, would start a daemon that indexes
+// all of it. The MCP frontend treats a refused root as unusable.
+func mcpClientRoot(dir string) (string, error) {
+	root, err := projectRootFor(dir)
+	if err != nil {
+		return "", err
+	}
+	if err := store.NonProjectRootError(root); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+// cmdMCP serves MCP to an agent. Like `dexter lsp`, it is a frontend of the
+// shared workspace daemon: it opens no index and starts no watcher, and every
+// tool call is answered by the daemon of the session's workspace, which it
+// starts when necessary. Logs go to stderr; stdout belongs to the MCP stdio
+// transport.
+//
+// With an explicit path (or --root) every session uses that workspace.
+// Without one, each session's root is negotiated through MCP roots and
+// resolved like the CLI resolves its own, with the launch directory as the
+// fallback for clients that give no root.
+func cmdMCP(projectRoot string, listen string, listenUnsafe bool, explicitRoot bool) {
+	log.SetOutput(os.Stderr)
+	if listen != "" {
+		if err := dexter_mcp.CheckListenAddr(listen, listenUnsafe); err != nil {
+			fatal(err)
+		}
+	} else if listenUnsafe {
+		fatal(fmt.Errorf("--listen-unsafe needs --listen"))
+	}
+	cfg, err := mcpConfig(projectRoot, explicitRoot)
+	if err != nil {
+		fatal(err)
+	}
+	root := cfg.Root
+	frontend := dexter_mcp.NewFrontend(cfg)
+	defer frontend.Close()
+	if explicitRoot {
+		log.Printf("Dexter MCP v%s starting (root: %s, daemon log: %s)", version.Version, root, daemonLogPath(root))
+	} else {
+		log.Printf("Dexter MCP v%s starting (workspace roots negotiated per session; fallback root: %s)", version.Version, root)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if listen != "" {
+		ln, err := net.Listen("tcp", listen)
+		if err != nil {
+			fatal(err)
+		}
+		log.Printf("MCP server listening on %s", ln.Addr())
+		if err := dexter_mcp.CheckListenAddr(listen, false); err != nil {
+			log.Printf("WARNING: --listen-unsafe: the MCP server on %s has no authentication; anyone who can reach it can read this code and rename symbols", ln.Addr())
+		}
+		httpSrv := &http.Server{Handler: dexter_mcp.HTTPHandler(frontend), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutdownCtx)
+		}()
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			fatal(err)
+		}
+		return
+	}
+
+	if err := dexter_mcp.RunStdio(ctx, frontend); err != nil && ctx.Err() == nil {
+		fatal(err)
+	}
 }

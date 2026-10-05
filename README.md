@@ -29,6 +29,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
   - [Look up definitions](#look-up-definitions)
   - [Find references](#find-references)
   - [Reindexing files manually](#reindexing-files-manually)
+- [MCP server](#mcp-server)
 - [Hover documentation](#hover-documentation)
   - [Cursor-position-aware resolution](#cursor-position-aware-resolution)
 - [Rename](#rename)
@@ -492,6 +493,31 @@ When running as an LSP server, dexter automatically:
 - Runs an incremental reindex on startup
 - Watches `.git/HEAD` for branch switches and reindexes when detected
 
+## MCP server
+
+Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`, so AI agents can navigate Elixir codebases through the index instead of grep. Tools cover symbol search, definitions with docs and specs, references, module API summaries, file outlines, behaviour/protocol implementations, call hierarchy, incremental reindexing, and workspace-wide rename.
+
+Register it with your MCP client. For Claude Code:
+
+```sh
+claude mcp add dexter -- dexter mcp
+```
+
+Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the CLI does, so it binds the project the client is working in rather than the directory it was launched from. Clients that provide no roots get the launch directory (when it is a project), and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. One session serves one workspace: when a client gives several roots, the session uses the first one that is a usable project (an existing directory inside an Elixir project, not the home directory) and ignores the others. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server.
+
+`dexter mcp` is a frontend of the workspace daemon, like `dexter lsp` and the CLI: it starts the daemon when necessary and keeps no index of its own. The tools answer from the same index, watchers, and caches as the editor, so edits made directly by an agent are indexed by the daemon's file watcher, and a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. A tool that answers from an index that is still building or degraded says so in its answer. The tools read file text the way the user sees it: when an editor attached to the same daemon holds a file open with changes it has not saved (and the file on disk has not changed since), outlines, definition snippets, and reference lines come from that buffer (with its line numbers), and the answer says so. The rename tool writes on disk and does not yet look at editor buffers, so save your editor's changes before an agent renames.
+
+Useful variants:
+
+```sh
+# Serve over streamable HTTP instead of stdio (loopback addresses only; the
+# server has no authentication, so another address needs --listen-unsafe)
+dexter mcp --listen localhost:8092
+
+# Print the agent-facing usage guide (save as context for clients that want it)
+dexter mcp --instructions
+```
+
 ## Hover documentation
 
 Dexter serves hover docs (`textDocument/hover`) for functions, modules, and types. When you hover over a symbol, it looks up the definition in the index and reads the `@doc`, `@moduledoc`, `@typedoc`, or `@spec` annotations from the source file.
@@ -616,7 +642,7 @@ dexter init .
 One background process per project owns the index, so your editor and the CLI
 see the same fresh index instead of each maintaining their own.
 
-The first `dexter lsp`, `dexter lookup`, `dexter references`, or `dexter reindex`
+The first `dexter lsp`, `dexter mcp`, `dexter lookup`, `dexter references`, or `dexter reindex`
 starts it, and it exits on its own after 15 minutes with no clients. Nothing
 about editor configuration changes: `dexter lsp` still speaks LSP over stdio, it
 just proxies to the daemon, and the protocol bytes are copied rather than
@@ -625,8 +651,8 @@ re-parsed.
 The daemon belongs to the workspace, not to whichever frontend started it. No
 editor owns the index for another: a second editor and a lookup in a shell both
 attach to the same daemon and share its index and resolution caches, so neither
-can see a different, staler answer. It is also the process an MCP frontend will
-attach to, so every frontend answers from one index.
+can see a different, staler answer. `dexter mcp` attaches to it too, so every
+frontend answers from one index.
 
 The daemon owns the SQLite index in `.dexter/` (one writer), the file watchers and
 `.git/HEAD` poll that drive incremental reindexes, stdlib and dependency
@@ -677,7 +703,7 @@ dexter init --force ~/code/my-elixir-project
 If the issue persists, enable debug mode to get verbose logs. You can do this in two ways:
 
 1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options)). It applies to that editor session as soon as it connects.
-2. Or set the `DEXTER_DEBUG=true` environment variable for the editor or CLI command that starts the workspace daemon. The daemon reads it when it starts, so if one is already running, run `dexter stop` first. This is also how to debug CLI commands such as `dexter lookup`.
+2. Or set the `DEXTER_DEBUG=true` environment variable for the editor or CLI command that starts the workspace daemon. The daemon reads it when it starts, so if one is already running, run `dexter stop --force` first (a plain stop is refused while an editor or an MCP session is attached). This is also how to debug CLI commands such as `dexter lookup`.
 
 Debug mode logs timing and resolution details for every definition, hover, references, and rename request. Each editor receives the lines for its own requests in its LSP log (in Neovim usually `~/.local/state/nvim/lsp.log`, in VS Code Output > Dexter). Every editor and CLI command for a workspace shares one daemon, and all of its lines, including those for CLI commands, also go to the daemon's log file: `<key>.log` in its runtime directory (`/tmp/dexter-<uid>` on macOS and Linux; see [docs/daemon.md](docs/daemon.md)). The first line `dexter lsp` writes to your editor's log names that file.
 
