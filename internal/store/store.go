@@ -2041,14 +2041,38 @@ func (s *Store) LookupFollowDelegateByArity(module, function string, arity int) 
 	return s.lookupFollowDelegate(module, function, arity, 0)
 }
 
+// declaredDelegateArity is the full arity of the declaration delegate belongs
+// to. Default arguments index one row per arity, but each calls the target
+// with every argument.
+func declaredDelegateArity(rows []LookupResult, delegate LookupResult) int {
+	arity := delegate.Arity
+	for _, r := range rows {
+		if r.Kind == "defdelegate" && r.FilePath == delegate.FilePath && r.Line == delegate.Line && r.Arity > arity {
+			arity = r.Arity
+		}
+	}
+	return arity
+}
+
 func (s *Store) lookupFollowDelegate(module, function string, arity, depth int) ([]LookupResult, error) {
 	if depth > 5 {
 		return nil, nil
 	}
 
-	results, err := s.LookupFunctionByArity(module, function, arity)
+	// Every arity is read so a delegate's declared arity is known: a
+	// `defdelegate run(x, opts \\ [])` row for run/1 still calls run/2.
+	all, err := s.LookupFunction(module, function)
 	if err != nil {
 		return nil, err
+	}
+	results := all
+	if arity >= 0 {
+		results = make([]LookupResult, 0, len(all))
+		for _, r := range all {
+			if r.Arity == arity {
+				results = append(results, r)
+			}
+		}
 	}
 	if len(results) == 0 {
 		return nil, nil
@@ -2081,7 +2105,7 @@ func (s *Store) lookupFollowDelegate(module, function string, arity, depth int) 
 			if group[0].DelegateAs != "" {
 				targetFunc = group[0].DelegateAs
 			}
-			targetResults, err := s.lookupFollowDelegate(targetModule, targetFunc, a, depth+1)
+			targetResults, err := s.lookupFollowDelegate(targetModule, targetFunc, declaredDelegateArity(all, group[0]), depth+1)
 			if err != nil {
 				return nil, err
 			}

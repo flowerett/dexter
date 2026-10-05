@@ -594,6 +594,53 @@ end
 	}
 }
 
+// A delegate with default arguments calls its target at the declared full arity.
+func TestDefinition_DefaultArgumentDelegateFollowsDeclaredArity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		worker string
+	}{
+		{"skips a target overload at the call arity", `defmodule SharedLib.Worker do
+  def run(x), do: x
+  def run(x, opts), do: {x, opts}
+end
+`},
+		{"reaches a target with only the full arity", `defmodule SharedLib.Worker do
+  def run(x, opts), do: {x, opts}
+end
+`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, cleanup := setupTestServer(t)
+			defer cleanup()
+
+			indexFile(t, server.store, server.projectRoot, "lib/worker.ex", tc.worker)
+			indexFile(t, server.store, server.projectRoot, "lib/api.ex", `defmodule SharedLib.Api do
+  defdelegate run(x, opts \\ []), to: SharedLib.Worker
+end
+`)
+			callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+			callerContent := `defmodule MyApp.Caller do
+  def call, do: SharedLib.Api.run(:value)
+end
+`
+			indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+			callerURI := "file://" + callerPath
+			server.docs.Set(callerURI, callerContent)
+
+			workerLines, _ := server.store.LookupFunctionByArity("SharedLib.Worker", "run", 2)
+			if len(workerLines) != 1 {
+				t.Fatalf("expected one indexed SharedLib.Worker.run/2, got %+v", workerLines)
+			}
+			locs := definitionAt(t, server, callerURI, 1, 30)
+			if len(locs) != 1 || !strings.HasSuffix(string(locs[0].URI), "/lib/worker.ex") ||
+				int(locs[0].Range.Start.Line) != workerLines[0].Line-1 {
+				t.Fatalf("expected SharedLib.Worker.run/2, got %+v", locs)
+			}
+		})
+	}
+}
+
 // Same-arity heads: "all" returns every head, "first" only the first.
 func TestDefinition_MultipleHeadsSameArity_StyleControlled(t *testing.T) {
 	server, cleanup := setupTestServer(t)
