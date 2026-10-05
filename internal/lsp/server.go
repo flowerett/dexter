@@ -1294,9 +1294,9 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 				return s.enclosingBlockPath(docURI, lineNum, col)
 			}, functionName); found {
-				if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+				if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, generatedFunctionsForCall(functions, callArity)); len(results) > 0 {
 					s.debugf("Definition: generated bare %q provider=%s precise=%t", functionName, provider.module, precise)
-					return storeResultsToLocations(results), nil
+					return s.applyDefinitionStyle(storeResultsToLocations(results)), nil
 				}
 			}
 			s.debugf("Definition: could not resolve bare function %q", functionName)
@@ -1345,9 +1345,9 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 			return s.enclosingBlockPath(docURI, lineNum, col)
 		}, functionName); found {
-			if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+			if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, generatedFunctionsForCall(functions, callArity)); len(results) > 0 {
 				s.debugf("Definition: generated fallback for bare %q provider=%s precise=%t", functionName, provider.module, precise)
-				return storeResultsToLocations(results), nil
+				return s.applyDefinitionStyle(storeResultsToLocations(results)), nil
 			}
 		}
 

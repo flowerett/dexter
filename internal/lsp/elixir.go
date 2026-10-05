@@ -121,10 +121,14 @@ func arityAtCallsite(tokens []parser.Token, source []byte, lineStarts []int, lin
 				startOffset := parser.LineColToOffset(lineStarts, line, startCol)
 				startIdx := parser.TokenAtOffset(tokens, startOffset)
 				prev := w.PreviousSigPos(startIdx)
-				if prev >= 0 && tokenCanOwnFollowingExpression(tokens[prev].Kind) {
+				switch {
+				case prev >= 0 && isDefinitionKeyword(tokens[prev].Kind):
+					// `def name(a, b) do` opens the body, not a keyword argument.
+				case prev >= 0 && tokenCanOwnFollowingExpression(tokens[prev].Kind):
 					return -1
+				default:
+					arity++
 				}
-				arity++
 			}
 		}
 	case j < n && tokens[j].Kind == parser.TokOther &&
@@ -285,6 +289,15 @@ func startsParenFreeCall(source []byte, tokens []parser.Token, pos int) bool {
 func isWordOperator(name string) bool {
 	switch name {
 	case "in", "and", "or", "not", "when":
+		return true
+	}
+	return false
+}
+
+func isDefinitionKeyword(kind parser.TokenKind) bool {
+	switch kind {
+	case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+		parser.TokDefguard, parser.TokDefguardp:
 		return true
 	}
 	return false

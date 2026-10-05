@@ -90,21 +90,21 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 			if opts.ExactArity {
 				generated = filterGeneratedFunctionsByArity(generated, opts.Arity)
 			}
-			if len(generated) == 0 {
-				return nil, nil
-			}
-			// A line the compiled module records for the function is its own
-			// definition, so even an exact lookup takes it.
-			var precise bool
-			results, precise = s.generatedDefinitionResultsFor(module, "", generated)
-			if !precise && opts.ExactModule {
-				if results, err = s.store.LookupModule(module); err != nil {
-					return nil, err
+			// No generated arity matching the call leaves the module fallback.
+			if len(generated) > 0 {
+				// A line the compiled module records for the function is its own
+				// definition, so even an exact lookup takes it.
+				var precise bool
+				results, precise = s.generatedDefinitionResultsFor(module, "", generated)
+				if !precise && opts.ExactModule {
+					if results, err = s.store.LookupModule(module); err != nil {
+						return nil, err
+					}
 				}
-			}
-			if !precise && len(results) > 0 {
-				results[0].Arity = generated[0].Arity
-				results[0].Kind = generated[0].Kind
+				if !precise && len(results) > 0 {
+					results[0].Arity = generated[0].Arity
+					results[0].Kind = generated[0].Kind
+				}
 			}
 		}
 	}
@@ -115,6 +115,19 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 		}
 	}
 	return s.lookupLocations(results, opts.ExcludeStdlib), nil
+}
+
+// generatedFunctionsForCall narrows generated functions to the call's arity,
+// keeping every arity when it is unknown or none matches: a generated function
+// is still the best target the call has.
+func generatedFunctionsForCall(functions []beam.Function, arity int) []beam.Function {
+	if arity < 0 {
+		return functions
+	}
+	if filtered := filterGeneratedFunctionsByArity(functions, arity); len(filtered) > 0 {
+		return filtered
+	}
+	return functions
 }
 
 func filterGeneratedFunctionsByArity(functions []beam.Function, arity int) []beam.Function {

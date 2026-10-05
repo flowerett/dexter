@@ -538,6 +538,16 @@ func TestArityAtCallsite_ComplexForms(t *testing.T) {
 			want: 1,
 		},
 		{
+			name: "definition head do block is not an argument",
+			code: "def run(left, right) do\n  :ok\nend",
+			want: 2,
+		},
+		{
+			name: "private macro head do block is not an argument",
+			code: "defmacrop run(left) do\n  :ok\nend",
+			want: 1,
+		},
+		{
 			name: "do block ends a parenthesis-free call",
 			code: "SharedLib.Worker.run(case x do\n  _ -> {1, 2}\nend, y)",
 			want: 2,
