@@ -438,6 +438,34 @@ end
 			t.Fatalf("expected both calculate/1 heads, got %+v", locs)
 		}
 	})
+
+	t.Run("ignores declarations in nested and later modules", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		content := `defmodule MyApp.Current do
+  def calculate, do: :current
+  def run, do: calculate()
+
+  defmodule Inner do
+    def calculate, do: :inner
+  end
+end
+
+defmodule MyApp.Other do
+  def calculate, do: :other
+end
+`
+		path := filepath.Join(server.projectRoot, "lib", "current.ex")
+		indexFile(t, server.store, server.projectRoot, "lib/current.ex", content)
+		uri := "file://" + path
+		server.docs.Set(uri, content)
+
+		locs := definitionAt(t, server, uri, 2, 17)
+		if len(locs) != 1 || locs[0].Range.Start.Line != 1 {
+			t.Fatalf("expected only MyApp.Current.calculate/0 on line 1, got %+v", locs)
+		}
+	})
 }
 
 func TestDefinition_UseChainSelectsProviderByArity(t *testing.T) {
@@ -473,6 +501,45 @@ end
 	server.docs.Set(callerURI, callerContent)
 
 	locs := definitionAt(t, server, callerURI, 2, 16)
+	if len(locs) != 1 || !strings.HasSuffix(string(locs[0].URI), "/lib/one.ex") {
+		t.Fatalf("expected SharedLib.One.execute/1, got %+v", locs)
+	}
+}
+
+func TestDefinition_UseChainSameInjectorDifferentOptsSelectsProviderByArity(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/one.ex", `defmodule SharedLib.One do
+  def execute(value), do: value
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/two.ex", `defmodule SharedLib.Two do
+  def execute(left, right), do: {left, right}
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/injector.ex", `defmodule SharedLib.Injector do
+  defmacro __using__(opts) do
+    provider = Keyword.get(opts, :provider, SharedLib.Two)
+    quote do
+      import unquote(provider)
+    end
+  end
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "consumer.ex")
+	callerContent := `defmodule MyApp.Consumer do
+  use SharedLib.Injector, provider: SharedLib.One
+  use SharedLib.Injector, provider: SharedLib.Two
+  def run, do: execute(:value)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/consumer.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	locs := definitionAt(t, server, callerURI, 3, 16)
 	if len(locs) != 1 || !strings.HasSuffix(string(locs[0].URI), "/lib/one.ex") {
 		t.Fatalf("expected SharedLib.One.execute/1, got %+v", locs)
 	}

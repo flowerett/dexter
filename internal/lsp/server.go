@@ -1306,7 +1306,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		// Current module — return buffer location directly (works before indexing).
 		// In a typespec the bare name is the type, everywhere else the function.
 		if fullModule == currentModule {
-			lines := tf.FindDefinitionLines(functionName, callArity, tf.InTypespec(lineNum))
+			lines := tf.FindDefinitionLines(fullModule, functionName, callArity, tf.InTypespec(lineNum))
 			if len(lines) > 0 {
 				locations := make([]protocol.Location, 0, len(lines))
 				for _, line := range lines {
@@ -2702,6 +2702,30 @@ func usingVisitKey(moduleName, which string) string {
 	return moduleName + "\x00" + which
 }
 
+// usingVisitKeyWithOpts also keys on the consumer opts: one injector used twice
+// with different opts selects different providers, so visiting it for one
+// `use` must not skip it for the other.
+func usingVisitKeyWithOpts(moduleName, which string, opts map[string]string) string {
+	key := usingVisitKey(moduleName, which)
+	if len(opts) == 0 {
+		return key
+	}
+	keys := make([]string, 0, len(opts))
+	for k := range opts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(key)
+	for _, k := range keys {
+		b.WriteByte(0)
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(opts[k])
+	}
+	return b.String()
+}
+
 // lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
 // `use` site (empty for an ordinary `use Module`).
 func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
@@ -2709,7 +2733,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 }
 
 func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool, arity int) []store.LookupResult {
-	visitKey := usingVisitKey(moduleName, which)
+	visitKey := usingVisitKeyWithOpts(moduleName, which, consumerOpts)
 	if visited[visitKey] {
 		return nil
 	}

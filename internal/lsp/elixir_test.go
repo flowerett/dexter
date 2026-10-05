@@ -487,6 +487,61 @@ func TestArityAtCallsite_ComplexForms(t *testing.T) {
 			code: "SharedLib.Worker.run :value, mode: :fast",
 			want: -1,
 		},
+		{
+			name: "unparenthesized if owns the following commas",
+			code: "SharedLib.Worker.run(if ready, do: :ok, else: :error)",
+			want: 1,
+		},
+		{
+			name: "unparenthesized for owns its generators",
+			code: "SharedLib.Worker.run(for x <- xs, y <- ys, do: {x, y})",
+			want: 1,
+		},
+		{
+			name: "unparenthesized with owns its clauses",
+			code: "SharedLib.Worker.run(with {:ok, a} <- fetch(), {:ok, b} <- load(a), do: b)",
+			want: 1,
+		},
+		{
+			name: "parenthesis-free remote call owns the following commas",
+			code: "SharedLib.Worker.run(MyApp.Accounts.get user, opts)",
+			want: 1,
+		},
+		{
+			name: "parenthesis-free call after a match owns the following commas",
+			code: "SharedLib.Worker.run(result = fetch user, opts)",
+			want: 1,
+		},
+		{
+			name: "parenthesis-free call as the last argument",
+			code: "SharedLib.Worker.run(:value, fetch user)",
+			want: 2,
+		},
+		{
+			name: "parenthesized if keeps outer arguments",
+			code: "SharedLib.Worker.run(if(ready, do: :ok), :value)",
+			want: 2,
+		},
+		{
+			name: "word operators are not calls",
+			code: "SharedLib.Worker.run(a in b, not c, d and e, f or g)",
+			want: 4,
+		},
+		{
+			name: "binary minus is not a call",
+			code: "SharedLib.Worker.run(a - 1, b - c, d)",
+			want: 3,
+		},
+		{
+			name: "unary minus after a space starts a call",
+			code: "SharedLib.Worker.run(fetch -1, d)",
+			want: 1,
+		},
+		{
+			name: "do block ends a parenthesis-free call",
+			code: "SharedLib.Worker.run(case x do\n  _ -> {1, 2}\nend, y)",
+			want: 2,
+		},
 	}
 
 	for _, tt := range tests {

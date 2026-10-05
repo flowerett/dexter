@@ -177,6 +177,10 @@ func countCallArgs(source []byte, tokens []parser.Token, openIdx int) (int, int)
 	args := 0
 	hasContent := false
 	keywordTail := false
+	// innerCall marks a parenthesis-free call such as `if ready, do: x` or
+	// `fetch user, opts` inside the argument list: Elixir gives it every
+	// following top-level comma until a do block ends it.
+	innerCall := false
 	for w.More() {
 		pos := w.Pos()
 		kind := w.CurrentKind()
@@ -188,8 +192,27 @@ func countCallArgs(source []byte, tokens []parser.Token, openIdx int) (int, int)
 				}
 				return 0, pos
 			}
+		case parser.TokDo:
+			if w.Depth() == 1 && w.BlockDepth() == 0 {
+				innerCall = false
+			}
+			hasContent = true
+		case parser.TokIdent:
+			if w.Depth() == 1 && w.BlockDepth() == 0 && !innerCall && startsParenFreeCall(source, tokens, pos) {
+				innerCall = true
+			}
+			hasContent = true
 		case parser.TokComma:
 			if w.Depth() == 1 && w.BlockDepth() == 0 {
+				if innerCall {
+					// Only a sole argument may be a parenthesis-free call
+					// followed by commas; anything else is a syntax error.
+					if args > 0 {
+						return -1, -1
+					}
+					w.Advance()
+					continue
+				}
 				// Elixir's trailing keyword syntax is one list argument even
 				// though its entries are separated by top-level commas.
 				if keywordTail {
@@ -216,6 +239,55 @@ func countCallArgs(source []byte, tokens []parser.Token, openIdx int) (int, int)
 		w.Advance()
 	}
 	return -1, -1
+}
+
+// startsParenFreeCall reports whether the identifier at pos is called without
+// parentheses, as in `if ready, ...` or `fetch user`: Elixir parses a name
+// followed by whitespace and the start of an expression as a call. Word
+// operators (`a in b`, `not c`) and binary minus (`a - 1`) are not calls.
+func startsParenFreeCall(source []byte, tokens []parser.Token, pos int) bool {
+	if pos+1 >= len(tokens) {
+		return false
+	}
+	name := string(source[tokens[pos].Start:tokens[pos].End])
+	if isWordOperator(name) {
+		return false
+	}
+	next := tokens[pos+1]
+	if next.Start <= tokens[pos].End {
+		// `foo(`, `foo.`, `foo[` and `foo:` are not parenthesis-free calls.
+		return false
+	}
+	switch next.Kind {
+	case parser.TokIdent:
+		return !isWordOperator(string(source[next.Start:next.End]))
+	case parser.TokModule, parser.TokNumber, parser.TokString, parser.TokHeredoc,
+		parser.TokSigil, parser.TokCharLiteral, parser.TokAtom, parser.TokOpenBracket,
+		parser.TokOpenBrace, parser.TokPercent, parser.TokFn, parser.TokAttr,
+		parser.TokAttrDoc, parser.TokAttrSpec, parser.TokAttrType,
+		parser.TokAttrBehaviour, parser.TokAttrCallback:
+		return true
+	case parser.TokOther:
+		if next.End-next.Start != 1 {
+			return false
+		}
+		switch source[next.Start] {
+		case '&', '^', '!':
+			return true
+		case '-', '+':
+			// `foo -1` is a call; `a - 1` is subtraction.
+			return pos+2 < len(tokens) && tokens[pos+2].Start == next.End
+		}
+	}
+	return false
+}
+
+func isWordOperator(name string) bool {
+	switch name {
+	case "in", "and", "or", "not", "when":
+		return true
+	}
+	return false
 }
 
 func tokenCanOwnFollowingExpression(kind parser.TokenKind) bool {
@@ -292,16 +364,43 @@ func (tf *TokenizedFile) FindTypeDefinition(functionName string) (int, bool) {
 	return tf.findDefinition(functionName, true)
 }
 
-// FindDefinitionLines returns all matching callable or type definition lines.
-// An arity below zero keeps every arity. preferType selects the namespace to
-// prefer when a type and callable share a name.
-func (tf *TokenizedFile) FindDefinitionLines(functionName string, arity int, preferType bool) []int {
+// FindDefinitionLines returns the callable or type definition lines declared
+// directly in module; declarations in nested or sibling modules belong to
+// those modules. An arity below zero keeps every arity. preferType selects the
+// namespace to prefer when a type and callable share a name.
+func (tf *TokenizedFile) FindDefinitionLines(module, functionName string, arity int, preferType bool) []int {
 	var functionLines, typeLines []int
+	type moduleFrame struct {
+		name       string
+		blockDepth int
+	}
+	var stack []moduleFrame
 	w := parser.NewTokenWalker(tf.source, tf.tokens)
 	for w.More() {
 		i := w.Pos()
 		tok := w.Current()
+		blockDepth := w.BlockDepth()
 		w.Advance()
+		switch tok.Kind {
+		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl:
+			parent := ""
+			if len(stack) > 0 {
+				parent = stack[len(stack)-1].name
+			}
+			if name, _, hasDo := tokParseModuleDef(tf.source, tf.tokens, i+1, parent); name != "" && hasDo {
+				// The walker counts the module's do when it reaches it.
+				stack = append(stack, moduleFrame{name: name, blockDepth: blockDepth + 1})
+			}
+			continue
+		case parser.TokEnd:
+			if len(stack) > 0 && stack[len(stack)-1].blockDepth == blockDepth {
+				stack = stack[:len(stack)-1]
+			}
+			continue
+		}
+		if len(stack) == 0 || stack[len(stack)-1].name != module {
+			continue
+		}
 		switch tok.Kind {
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
